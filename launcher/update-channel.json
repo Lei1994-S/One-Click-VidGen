@@ -1,17 +1,17 @@
 {
-  "release_id": "2026.09.22.3",
-  "release_order": 2026092203,
-  "display_version": "2026.09.22 重绘参考图库与 H3 校验修复",
+  "release_id": "2026.09.24.3",
+  "release_order": 2026092403,
+  "display_version": "2026.09.24 启动器更新校验修复",
   "branch": "main",
   "portable_overlay_safe": true,
   "portable_overlay_min_order": 2026081801,
   "archive_url": "https://github.com/IFRIT-Zhou/One-Click-VidGen/archive/refs/heads/main.zip",
   "archive_urls": [
-    "https://download.oneclickvidgen.com/releases/2026.09.22.3/One-Click-VidGen-main.zip",
-    "https://modelscope.cn/models/IFRIT95/One-Click-VidGen-Update-Mirror/resolve/master/releases/2026.09.22.3/One-Click-VidGen-main.zip",
+    "https://download.oneclickvidgen.com/releases/2026.09.24.3/One-Click-VidGen-main.zip",
+    "https://modelscope.cn/models/IFRIT95/One-Click-VidGen-Update-Mirror/resolve/master/releases/2026.09.24.3/One-Click-VidGen-main.zip",
     "https://github.com/IFRIT-Zhou/One-Click-VidGen/archive/refs/heads/main.zip"
   ],
   "archive_sha256": "",
-  "notes": "新增动态分镜重绘参考图库，可直观看到项目原始素材、后来上传素材及当前选用顺序，并支持移除和清空新增参考图。优化画面优先模式的少字策略，允许保留至多两处必要短字；修复 H3 将主体定义误判为擅自新增画中文字的问题。",
-  "content_fingerprint": "8c2e9678c6c9438754ef3d9e71e886e73611ad70a46549d896442db78e3897bc"
+  "notes": "修复启动器与发布工具的关键文件校验清单不一致，避免更新成功后误报仍需更新；发布前新增清单一致性检查。",
+  "content_fingerprint": "25e3ccf8e433b270a71ed9841eab7a58673976d06d663ca1b04e0b39c8615323"
 }
