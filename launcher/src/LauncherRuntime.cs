@@ -104,10 +104,15 @@ namespace OcvLauncher
             "frontend/src/studio.css",
             "frontend/src/useStudio.js",
             "frontend/src/useWorkspace.js",
-            "frontend/src/cloudPoolPreference.js",
             "frontend/src/videoPresentation.js",
             "frontend/src/components/ImageProfileSelector.vue",
-            "frontend/src/components/ImageStudio.vue",
+              "frontend/src/components/ImageStudio.vue",
+              "frontend/src/components/ApiSetupGuide.vue",
+              "frontend/src/components/LanguageModelPresets.vue",
+              "frontend/src/components/OperationStatus.vue",
+              "frontend/src/components/ResizableShotWorkspace.vue",
+              "frontend/src/components/ShotVideoOptions.vue",
+              "frontend/src/components/WorkspacePanels.vue",
             "frontend/src/components/ComfyUIVideoSelector.vue",
             "frontend/src/components/ComfyUIWorkbench.vue",
             "frontend/src/components/DynamicTextModeSelector.vue",
@@ -117,14 +122,22 @@ namespace OcvLauncher
             "frontend/src/components/SubtitleStyleEditor.vue",
             "frontend/src/components/VideoModelSettings.vue",
             "frontend/src/components/VideoShotNavigator.vue",
-            "frontend/src/components/VideoStudio.vue",
+              "frontend/src/components/VideoStudio.vue",
+              "frontend/src/workspaceLayout.js",
             "frontend/src/dynamicTextMode.js",
             "frontend/src/videoPromptWarnings.js",
+            "frontend/src/serialTaskQueue.js",
+            "frontend/src/rhWorkflowResolution.js",
             "backend/app/comfyui_bridge.py",
             "backend/app/h3_prompt_agent.py",
-            "backend/app/main.py",
+            "backend/app/presenter_mode.py",
+            "backend/app/tts_alignment.py",
+            "backend/vendor/pypinyin/__init__.py",
+            "backend/vendor/pypinyin/pinyin_dict.json",
+            "backend/vendor/pypinyin/phrases_dict.json",
+              "backend/app/main.py",
+              "backend/app/language_presets.py",
             "backend/app/gemini_client.py",
-            "backend/app/language_routing.py",
             "backend/app/image_profiles.py",
             "backend/app/indextts25_local.py",
             "backend/app/local_tts_component.py",
@@ -147,6 +160,7 @@ namespace OcvLauncher
             "backend/app/video_group_repair.py",
             "backend/app/video_image_prompt.py",
             "backend/app/video_model_config.py",
+            "backend/app/runninghub_workflow_video.py",
             "backend/app/video_motion_plan.py",
             "backend/app/video_plan.py",
             "backend/app/video_prompt_notices.py",
@@ -167,7 +181,29 @@ namespace OcvLauncher
             "launcher/safe_update_helper.ps1",
             "launcher/update-sources.json",
             "tools/deploy_indextts25.ps1",
-            "tools/portable_preflight.py"
+            "tools/portable_preflight.py",
+            "backend/app/codex_bridge.py",
+            "backend/app/codex_shot_edit.py",
+            "backend/app/codex_scene_management.py",
+            "backend/app/codex_image_generation.py",
+            "backend/app/openai_image_adapter.py",
+            "backend/app/managed_comfyui.py",
+            "backend/app/managed_comfyui_worker.py",
+            "backend/app/model_library.py",
+            "backend/app/model_sources.json",
+            "frontend/src/components/CodexBridgePanel.vue",
+            "frontend/src/components/ManagedComfyUI.vue",
+            "frontend/src/components/ModelInstallGuide.vue",
+            "frontend/src/components/ShotReferencePreview.vue",
+            "plugins/codex_bridge/plugin.json",
+            "plugins/codex_bridge/ocv_bridge.py",
+            "plugins/codex_bridge/README.md",
+            "plugins/codex_bridge/skills/ocv-production-bridge/SKILL.md",
+            "plugins/codex_bridge/skills/ocv-production-bridge/agents/openai.yaml",
+            "comfyui_plugins/README.md",
+            "comfyui/README.md",
+            "tts/README.md",
+            "tools/migrate_optional_components.ps1"
         };
         private readonly string root;
 
@@ -340,7 +376,8 @@ namespace OcvLauncher
                 AddFileCheck(items, "FFmpeg", Path.Combine(root, "tools", "ffmpeg", "bin", "ffmpeg.exe"));
                 AddDirectoryCheck(items, "根目录依赖", Path.Combine(root, "node_modules", "hyperframes"));
                 AddDirectoryCheck(items, "前端依赖", Path.Combine(root, "frontend", "node_modules"));
-                string ttsModelRoot = Path.Combine(root, "tools", "IndexTTS25", "checkpoints");
+                string ttsModelRoot = Path.Combine(root, "models", "tts", "indextts25");
+                if (!Directory.Exists(ttsModelRoot)) ttsModelRoot = Path.Combine(root, "tools", "IndexTTS25", "checkpoints");
                 bool localTtsInstalled = File.Exists(Path.Combine(ttsModelRoot, "config.yaml"))
                     && File.Exists(Path.Combine(ttsModelRoot, "gpt.pth"))
                     && File.Exists(Path.Combine(ttsModelRoot, "codec.pth"))
@@ -979,7 +1016,7 @@ namespace OcvLauncher
             string extension = Path.GetExtension(path).ToLowerInvariant();
             bool isText = extension == ".bat" || extension == ".css" || extension == ".js"
                 || extension == ".cjs" || extension == ".json" || extension == ".ps1" || extension == ".py"
-                || extension == ".vue";
+                || extension == ".vue" || extension == ".md" || extension == ".yaml";
             if (!isText) return ComputeFileSha256(path);
 
             string text = File.ReadAllText(path, Encoding.UTF8)

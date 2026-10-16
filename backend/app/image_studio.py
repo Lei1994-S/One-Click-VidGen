@@ -1,5 +1,6 @@
 """Independent single-image workspace. One submission, no automatic retries."""
 import base64
+import hashlib
 import json
 import mimetypes
 import os
@@ -16,18 +17,68 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from .auth import require_user
 from .editor import upload_path
+from .cloud_image_channel import ImageSize
 
 router = APIRouter(prefix='/api/image-studio')
 ROOT = Path(__file__).resolve().parents[2] / 'workspace' / 'image_studio'
 LOCK = threading.RLock()
-ACTIVE: set[int] = set()
+ACTIVE: set[tuple[int, str]] = set()
+QUEUED = []
+RUNNING_LANES = {}
+
+
+def enqueue(user, path, record, config, client=None):
+    import module4_video_render as visual
+    lane = hashlib.sha256((str(user)+'|'+str(config.get('endpoint'))+'|'+str(config.get('api_key'))).encode()).hexdigest()
+    limit = min(32, visual._poster_worker_count([config], 32))
+    with LOCK:
+        key = (user, record['id'])
+        if key in ACTIVE:
+            raise RuntimeError('该图片已经在队列中')
+        if sum(u == user for u, _ in ACTIVE) >= 100:
+            raise RuntimeError('图片队列已满，请等待部分任务完成')
+        record.update(status='queued', message='已加入队列，等待出图名额')
+        save(path, record)
+        ACTIVE.add(key)
+        QUEUED.append((user, path, record, config, client, lane, limit))
+        dispatch()
+
+
+def dispatch():
+    # All callers hold LOCK; each worker owns an immutable submission snapshot.
+    for entry in list(QUEUED):
+        user, path, record, config, client, lane, limit = entry
+        if RUNNING_LANES.get(lane, 0) >= limit:
+            continue
+        QUEUED.remove(entry)
+        RUNNING_LANES[lane] = RUNNING_LANES.get(lane, 0) + 1
+        record.update(status='running', message='正在提交')
+        save(path, record)
+        def work(entry=entry):
+            user, path, record, config, client, lane, _ = entry
+            try:
+                execute(user, path, record, config, client)
+            finally:
+                with LOCK:
+                    ACTIVE.discard((user, record['id']))
+                    RUNNING_LANES[lane] -= 1
+                    dispatch()
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except Exception as exc:
+            ACTIVE.discard((user, record['id']))
+            RUNNING_LANES[lane] -= 1
+            record.update(status='failed', message='启动出图任务失败：'+str(exc))
+            save(path, record)
 
 
 class ImageRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=20000)
     provider: Literal['custom', 'pool'] = 'custom'
+    method: Literal['running', 'ican'] = 'running'
+    size: ImageSize = "2560x1440"
     profile_id: str | None = Field(default=None, max_length=80)
-    ratio: Literal['2:1', '16:9', '3:2', '1:1', '3:4', '9:16', '21:9'] = '2:1'
+    ratio: Literal['2:1', '16:9', '3:2', '1:1', '3:4', '2:3', '9:16', '21:9'] = '2:1'
     resolution: Literal['', '1k', '2k', '4k'] = ''
     references: list[str] = Field(default_factory=list, max_length=4)
 
@@ -57,6 +108,9 @@ def config_for(user: int, data: ImageRequest):
                       upload_url=base+'/image-pool/media/upload',
                       api_key=runtime['access_token'], refresh_token=runtime['refresh_token'],
                       cloud_base_url=base, cloud_pool='1')
+        config.update({key: runtime[key] for key in ('cloud_user_id', 'cloud_session_store_path') if key in runtime})
+        from .cloud_image_channel import configure_channel
+        config = configure_channel(config, data.method, data.size)
     else:
         if data.profile_id:
             from .image_profiles import profile_environment, profile_snapshot
@@ -118,7 +172,7 @@ def execute(user: int, path: Path, record: dict, config: dict, cloud_pool_client
         if config.get('cloud_pool') == '1':
             payload['clientJobId'] = 'image-studio-' + record['id']
         with requests.Session() as session:
-            if record['references']:
+            if record['references'] and not record.get('remote_task_id'):
                 if config.get('reference_images') is False:
                     raise ValueError('所选图像模型配置未启用参考图能力')
                 if config.get('cloud_pool') == '1':
@@ -135,17 +189,23 @@ def execute(user: int, path: Path, record: dict, config: dict, cloud_pool_client
                         for name in record['references']
                     ]
                 endpoint = config.get('reference_endpoint') or endpoint.replace('/text-to-image', '/image-to-image')
+            from .cloud_image_channel import generation_payload
+            payload = generation_payload(payload, config)
             headers = {'Authorization': 'Bearer '+config['api_key']}
             # Keep the same clientJobId while renewing a short-lived cloud token.
             # A 401 therefore resumes polling the original task instead of creating
             # another billed image job.
             generation_attempted = True
-            response = visual._request_with_cloud_refresh(
-                session, 'POST', endpoint, json=payload, headers=headers, config=config, timeout=60
-            )
-            response.raise_for_status()
-            result = response.json()
-            task_id = visual._find_first_key(result, {'taskId', 'taskID', 'id'})
+            task_id = record.get('remote_task_id')
+            if not task_id:
+                response = visual._request_with_cloud_refresh(
+                    session, 'POST', endpoint, json=payload, headers=headers, config=config, timeout=60
+                )
+                response.raise_for_status()
+                result = response.json()
+                task_id = visual._find_first_key(result, {'taskId', 'taskID', 'id'})
+            else:
+                result = {}
             if not task_id:
                 raise RuntimeError(visual._runninghub_error_message(result) or '服务未返回任务 ID，提交结果尚未确认')
             record['remote_task_id'] = str(task_id)
@@ -198,19 +258,17 @@ def execute(user: int, path: Path, record: dict, config: dict, cloud_pool_client
                 except ValueError:
                     pass
             message = f'网络或接口错误：{type(exc).__name__}；{detail or message}。结果尚未确认，请核对扣费后再生成。'
-        record.update(status='failed', message=message)
+        record.update(status='paused' if isinstance(exc, visual.CloudImageLoginRequired) else 'failed', message=message)
     finally:
         try:
             save(path, record)
         finally:
-            if cloud_pool_client is not None and config.get('cloud_pool') == '1':
+            if cloud_pool_client is not None and config.get('cloud_pool') == '1' and not config.get('cloud_user_id'):
                 cloud_pool_client.adopt_image_pool_runtime({
                     'access_token': config.get('api_key'),
                     'refresh_token': config.get('refresh_token'),
                     'expires_in': 900,
                 })
-            with LOCK:
-                ACTIVE.discard(user)
 
 
 @router.post('')
@@ -218,10 +276,6 @@ def create(data: ImageRequest, request: Request):
     user = int(require_user(request)['id'])
     if not data.prompt.strip():
         raise HTTPException(400, '请填写提示词')
-    with LOCK:
-        if user in ACTIVE:
-            raise HTTPException(409, '图片工作室已有图片正在生成')
-        ACTIVE.add(user)
     path = None
     try:
         config, cloud_pool_client = config_for(user, data)
@@ -247,16 +301,49 @@ def create(data: ImageRequest, request: Request):
             shutil.copy2(source, path/name)
             names.append(name)
         record = dict(id=identity, created_at=time.time(), status='running', message='正在提交',
-                      prompt=data.prompt, provider=data.provider, ratio=data.ratio,
+                      prompt=data.prompt, provider=data.provider, method=data.method,
+                      size=data.size, ratio=data.ratio,
                       profile_id=data.profile_id, profile_name=config.get('profile_name') or '',
-                      resolution=config['resolution'], references=names)
+                      resolution=data.size if data.provider == 'pool' and data.method == 'ican' else config['resolution'], references=names)
+        if data.provider == 'pool' and data.method == 'ican':
+            from math import gcd
+            width, height = map(int, data.size.split('x'))
+            divisor = gcd(width, height)
+            record['ratio'] = f'{width // divisor}:{height // divisor}'
         save(path, record)
-        threading.Thread(target=execute, args=(user,path,record,config,cloud_pool_client), daemon=True).start()
+        enqueue(user, path, record, config, cloud_pool_client)
         return record
     except Exception as exc:
-        with LOCK:
-            ACTIVE.discard(user)
+        if path is not None and (path/'record.json').is_file():
+            record.update(status='failed', message=str(exc))
+            save(path, record)
+        if getattr(exc, 'code', '') == 'CLOUD_LOGIN_REQUIRED':
+            raise HTTPException(401, '[CLOUD_LOGIN_REQUIRED] 登录已过期，请重新登录') from exc
         raise HTTPException(400, str(exc)) from exc
+
+
+@router.post('/{identity}/resume')
+def resume_image(identity: str, request: Request):
+    user = int(require_user(request)['id'])
+    path = folder(user, identity)
+    with LOCK:
+        if not (path / 'record.json').is_file():
+            raise HTTPException(404, '图片记录不存在')
+        record = json.loads((path / 'record.json').read_text(encoding='utf-8'))
+        if record.get('status') != 'paused':
+            raise HTTPException(409, '只有等待重新登录的图片可以继续')
+        try:
+            config, client = config_for(user, ImageRequest(**{
+                key: record[key] for key in ('prompt', 'provider', 'method', 'size', 'profile_id', 'ratio', 'references') if key in record
+            }, resolution=record['resolution'] if record['resolution'] in ('1k', '2k', '4k') else ''))
+        except Exception as exc:
+            if getattr(exc, 'code', '') == 'CLOUD_LOGIN_REQUIRED':
+                raise HTTPException(401, '[CLOUD_LOGIN_REQUIRED] 登录已过期，请重新登录') from exc
+            raise
+        record.update(status='running', message='继续获取原任务结果')
+        save(path, record)
+        enqueue(user, path, record, config, client)
+    return record
 
 
 @router.get('')
@@ -266,10 +353,25 @@ def history(request: Request):
     with LOCK:
         for file in (ROOT/str(user)).glob('*/record.json'):
             record = json.loads(file.read_text(encoding='utf-8'))
-            if record['status'] == 'running' and user not in ACTIVE:
-                record.update(status='failed', message='后端已重启，远端结果尚未确认，请核对扣费后再生成')
+            if record['status'] in ('running', 'queued') and (user,record['id']) not in ACTIVE:
+                record.update(status='failed', message='后端已重启，排队任务未自动提交；如任务此前已运行，请核对远端结果后再生成')
             records.append(record)
     return {'items': sorted(records, key=lambda item:item['created_at'], reverse=True)}
+
+
+@router.post('/{identity}/cancel-queue')
+def cancel_queued(identity: str, request: Request):
+    user = int(require_user(request)['id'])
+    with LOCK:
+        entry = next((e for e in QUEUED if e[0] == user and e[2]['id'] == identity), None)
+        if entry is None:
+            raise HTTPException(409, '任务已经开始或不在队列中，不能取消排队')
+        QUEUED.remove(entry)
+        ACTIVE.discard((user, identity))
+        record = entry[2]
+        record.update(status='cancelled', message='已取消排队，未提交出图')
+        save(entry[1], record)
+        return record
 
 
 @router.get('/{identity}/files/{name}')
@@ -285,7 +387,7 @@ def image_file(identity: str, name: str, request: Request):
 def remove(request: Request, identity: str = ''):
     user = int(require_user(request)['id'])
     with LOCK:
-        if user in ACTIVE:
+        if any(u == user and (not identity or i == identity) for u, i in ACTIVE):
             raise HTTPException(409, '请等待当前生成完成后删除历史')
         paths = [folder(user,identity)] if identity else list((ROOT/str(user)).glob('*'))
         for path in paths:

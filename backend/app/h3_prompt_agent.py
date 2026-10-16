@@ -36,6 +36,12 @@ _TIME_RANGE = re.compile(
 _SYSTEM = r"""You are OCV H3 Prompt Agent. Your only job is to convert one already-approved,
 model-neutral video prompt into the official MiniMax H3 full-reference (Ref2VA) prompt format.
 Do not redesign the storyboard, alter narration boundaries, add new facts, or change the core image.
+The model_neutral_video_prompt is the sole approved creative instruction, including manual edits.
+The attached image supplies visual reference, not permission to override explicit source instructions.
+Preserve explicitly specified clothing, props, actions, framing and camera movement. Do not infer
+extra props or actions from a character's identity. Do not restore older storyboard concepts.
+When image details conflict with explicit source instructions, describe the requested result;
+retain only compatible image details. Never invent split screens, time periods or extra characters.
 
 Follow the official h3-prompt-writing skill contract:
 1. Write exactly these six sections, in exactly this order:
@@ -48,7 +54,10 @@ Follow the official h3-prompt-writing skill contract:
    anchor. It may be a near-opening image, but it is not a command to keep every depicted element
    visible at once or to return to the same composition at the end.
 4. Use concrete chronological stages with [Shot N] and [HH:MM-HH:MM]. The final timestamp must
-   exactly equal requested_duration_seconds, which is always 4-15 seconds.
+   exactly equal requested_duration_seconds. Normally 4-15 seconds is recommended;
+   a user-selected longer duration must be preserved exactly.
+   A continuous source shot stays one [Shot 1] spanning the full duration. Chronological phases
+   are not camera cuts. Add cuts or new framing only when explicitly requested in the source.
 5. Describe composition, subjects, positions, environment, actions/state changes, camera motion,
    physical sound, and exactly when referenced content appears. Prefer specific observable actions.
 6. Do not introduce unresolved reference labels. Define any <Subject N> before using it.
@@ -66,6 +75,12 @@ Follow the official h3-prompt-writing skill contract:
 9. OCV uses H3 for silent-performance animation with generated diegetic effects only. Never generate
    human speech, dialogue, narration, whispers, chanting, humming, singing, crowd voices, or vocal
    reactions. Generate only environmental ambience and physical/action sound effects.
+   Exception for visible performance: when reference_audio_requires_lipsync is true, the visible
+   presenter MUST open and close their mouth naturally in precise sync with <Audio 1>. The no-speech
+   output-audio policy does NOT mean closed lips or silent body acting. Supplied spoken_text is the
+   exact performance script, not visible text. Do not paraphrase it, add words, or render captions.
+   Put the exact original-language spoken_text only in subject_definitions as the <Audio 1> script;
+   detailed_description must refer to that script and describe lip-sync, not print the dialogue.
 10. Preserve the lighting direction, shadow placement, exposure, contrast, and color temperature of
    <Picture 1> as closely as possible. Do not invent dramatic relighting, flicker, lens flares, or a
    day/night change unless the approved source explicitly requests it. A centered presenter, podium,
@@ -96,7 +111,7 @@ Follow the official h3-prompt-writing skill contract:
    or the single camera movement already approved by the source prompt.
 16. Use concrete physical verbs, materials, directions, speeds, amplitudes and screen positions.
    Avoid empty adjectives such as cinematic, atmospheric, stunning, or dramatic. Aim for roughly
-   250-500 English words when the approved action has enough events, but never pad a short 4-15 second
+   250-500 English words when the approved action has enough events, but never pad a short
    shot or schedule more actions than can visibly finish.
 
 Return only a JSON object: {"h3_prompt":"..."}. The h3_prompt value contains the six sections.
@@ -135,6 +150,18 @@ def _repair_section_structure(prompt: str) -> str:
         words = re.escape(name).replace(r"_", r"[\s_-]+")
         pattern = rf"(?im)^\s*(?:[#>*-]+\s*)?(?:\*\*)?{words}(?:\*\*)?\s*:?[ \t]*$"
         prompt = re.sub(pattern, f"{name}:", prompt)
+    # Some providers put all six headings and their bodies on one line.
+    # Recognize those before filling missing sections, otherwise valid bodies
+    # become trapped in subject_definitions and duplicate placeholders appear.
+    headings = '|'.join(re.escape(name).replace('_', r'[ \t_-]+') for name in _SECTIONS)
+    prompt = re.sub(
+        rf'(?i)(?<![\w])\s*(?:\*\*)?({headings})(?:\*\*)?[ \t]*:\s*',
+        lambda match: '\n\n' + re.sub(r'[ \t-]+', '_', match.group(1).lower()) + ':\n',
+        prompt,
+    ).strip()
+    for name in _SECTIONS:
+        if len(re.findall(rf'(?im)^\s*{name}\s*:', prompt)) > 1:
+            raise ValueError(f'H3 转换结果包含重复的 {name} 段落，请重新转换')
     defaults = {
         "subject_definitions": "<Picture 1> is the supplied core storyboard image and visual anchor.",
         "summary": "Create the approved target-video action using <Picture 1> as the visual anchor.",
@@ -278,7 +305,7 @@ def _enforce_no_background_music(prompt: str) -> str:
     return prompt[:body_start] + policy + "\n" + prompt[body_end:]
 
 
-def _enforce_visual_and_sound_policy(prompt: str) -> str:
+def _enforce_visual_and_sound_policy(prompt: str, *, lipsync: bool = False) -> str:
     """Apply only the mandatory H3 output-audio policy to the submitted prompt.
 
     Lighting and camera guidance belongs to the conversion Agent's system
@@ -292,6 +319,9 @@ def _enforce_visual_and_sound_policy(prompt: str) -> str:
             "sound effects. Do not generate any human speech, dialogue, narration, whispering, "
             "chanting, humming, singing, crowd voices, or vocal reactions."
         )
+        if lipsync:
+            sound += (' This restriction concerns generated sound only: the visible presenter must '
+                      'speak visually with natural mouth movement synchronized to <Audio 1>, never closed-mouth narration.')
         prompt = prompt[:body_start] + sound + "\n" + prompt[body_end:]
     subtitle_policy = (
         "Do not generate subtitles, automatic captions, lower thirds, narration transcription, title "
@@ -345,7 +375,7 @@ def _validate(prompt: str, duration: int, *, reference_audio: bool = False,
     if "<Picture 1>" not in prompt:
         raise ValueError("H3 转换结果没有保留核心分镜图标签 <Picture 1>")
     prompt = _enforce_reference_audio(prompt, reference_audio=reference_audio, lipsync=lipsync)
-    prompt = _enforce_visual_and_sound_policy(prompt)
+    prompt = _enforce_visual_and_sound_policy(prompt, lipsync=bool(reference_audio and lipsync))
     prompt = _enforce_no_background_music(prompt)
     prompt = _repair_timeline(prompt, duration)
     ranges = re.findall(r"\[(\d{2}):(\d{2})-(\d{2}):(\d{2})\]", prompt)
@@ -357,24 +387,25 @@ def _validate(prompt: str, duration: int, *, reference_audio: bool = False,
     # Prevent a malformed response from silently becoming an expensive GPU run.
     if len(prompt) < 500 or len(prompt) > 16000:
         raise ValueError("H3 转换结果长度异常")
-    if not 4 <= duration <= 15:
-        raise ValueError("H3 仅接受 4～15 秒的镜头提示词")
-    return prompt
+    if duration < 4:
+        raise ValueError("H3 镜头请求至少需要4秒")
+    return _repair_section_structure(prompt)
 
 
 def source_fingerprint(shot: dict[str, Any], duration: int, *, reference_audio: bool = False,
                        lipsync: bool = False, image_digest: str = '') -> str:
     source = {
-        "intent": str(shot.get("intent") or ""),
-        "action": str(shot.get("action") or ""),
-        "image_prompt": str(shot.get("image_prompt") or ""),
         "video_prompt": str(shot.get("video_prompt") or ""),
+        "approved_visible_texts": approved_visible_texts(shot.get("motion_plan")),
         "duration": duration,
         "reference_audio": reference_audio,
         "reference_audio_lipsync": lipsync,
         "core_image_digest": image_digest,
+        "spoken_text": [row.get('text', '') for row in shot.get('source_subtitles', [])] if reference_audio else [],
+        "audio_digest": shot.get('reference_audio_digest', '') if reference_audio else '',
+        "audio_interval": [shot.get('start'), shot.get('duration')] if reference_audio else [],
         "skill": H3_SKILL_SOURCE,
-        "contract": 11,
+        "contract": 13,
     }
     return hashlib.sha256(json.dumps(source, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -393,13 +424,11 @@ def convert_for_h3(shot: dict[str, Any], duration: int, *, reference_audio: bool
         raise ValueError("通用视频提示词为空，无法转换为 H3 提示词")
     payload = {
         "requested_duration_seconds": duration,
-        "storyboard_intent": str(shot.get("intent") or ""),
-        "approved_dynamic_expression": str(shot.get("action") or ""),
-        "core_image_prompt_for_context": str(shot.get("image_prompt") or ""),
         "model_neutral_video_prompt": generic,
         "approved_visible_texts": approved_visible_texts(shot.get("motion_plan")),
         "reference_audio_supplied": reference_audio,
         "reference_audio_requires_lipsync": bool(reference_audio and lipsync),
+        "spoken_text": '\n'.join(str(row.get('text') or '') for row in shot.get('source_subtitles', [])) if reference_audio and lipsync else '',
         "core_storyboard_image_attached": bool(image_data),
         "core_storyboard_image_sha256": image_digest,
         "reference_assets": [
@@ -407,22 +436,54 @@ def convert_for_h3(shot: dict[str, Any], duration: int, *, reference_audio: bool
         ] + ([{"label": "<Audio 1>", "role": "final TTS segment / timing and performance reference"}]
              if reference_audio else []),
     }
-    raw = generate_gemini_text(
-        system_prompt=_SYSTEM,
-        user_prompt=json.dumps(payload, ensure_ascii=False),
-        temperature=0.1,
-        max_output_tokens=7000,
-        response_mime_type="application/json",
-        json_root="object",
-        image_data=image_data,
-    )
-    result = parse_json_response(raw)
-    for _ in range(2):
-        if not isinstance(result, str):
-            break
-        result = parse_json_response(result)
-    if not isinstance(result, dict) or not isinstance(result.get("h3_prompt"), str):
-        raise ValueError("H3 提示词 Agent 未返回有效 JSON 对象")
+    # Bounded repair for malformed JSON or invented visible text; never relax
+    # the approved text whitelist or submit an invalid result to generation.
+    text_feedback = ''
+    for attempt in range(3):
+        format_instruction = '' if attempt == 0 else (
+            '\nYour previous response could not be parsed as the required JSON object. '
+            'Regenerate from the same approved inputs. Return only one valid JSON object '
+            'with a non-empty string field "h3_prompt". Escape newlines as \\n and '
+            'double quotes as \\" inside JSON strings; no Markdown or extra commentary.'
+        )
+        raw = generate_gemini_text(
+            system_prompt=_SYSTEM + format_instruction + text_feedback,
+            user_prompt=json.dumps(payload, ensure_ascii=False),
+            temperature=0.1,
+            max_output_tokens=7000,
+            response_mime_type="application/json",
+            json_root="object",
+            image_data=image_data,
+        )
+        try:
+            result = parse_json_response(raw)
+            for _ in range(2):
+                if not isinstance(result, str):
+                    break
+                result = parse_json_response(result)
+            if not isinstance(result, dict) or not isinstance(result.get('h3_prompt'), str) or not result['h3_prompt'].strip():
+                raise ValueError('missing h3_prompt string')
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            if attempt == 2:
+                raise ValueError('H3 提示词转换返回格式不正确，已自动重试 2 次仍未取得有效 JSON；尚未提交 ComfyUI，原提示词及素材保留。请稍后重试或切换语言模型。') from exc
+        else:
+            prompt = _validate(result['h3_prompt'], duration, reference_audio=reference_audio, lipsync=lipsync)
+            issues = visual_first_prompt_issues(
+                _section_body(prompt, 'detailed_description'), shot.get('motion_plan'))
+            if not issues:
+                break
+            if attempt == 2:
+                raise ValueError('H3 转换结果重新加入了未选用的画中文字：' + '；'.join(issues)
+                                 + '；已自动纠正重试仍未通过，尚未提交视频生成。')
+            text_feedback = (
+                '\nThe previous conversion invented unapproved visible text: '
+                + json.dumps(issues, ensure_ascii=False)
+                + '\nRegenerate from the original approved inputs. Remove those invented labels, '
+                  'including case numbers and card headings. Cards may remain blank shapes; '
+                  'do not replace the forbidden words with synonyms or translated labels. '
+                  'Text visible in the reference image is NOT permission to render it. '
+                  'Only approved_visible_texts may be rendered. Preserve the approved actions '
+                  'and approved text exactly. Do not quote forbidden labels even in negative instructions.')
     prompt = _validate(result["h3_prompt"], duration, reference_audio=reference_audio, lipsync=lipsync)
     # Only the playback description instructs H3 to render new on-screen
     # content.  Scanning subject_definitions with the generic quote matcher can
@@ -433,4 +494,9 @@ def convert_for_h3(shot: dict[str, Any], duration: int, *, reference_audio: bool
     )
     if issues:
         raise ValueError("H3 转换结果重新加入了未选用的画中文字：" + "；".join(issues))
+    if reference_audio and lipsync:
+        text = payload['spoken_text']
+        if text and text not in _section_body(prompt, 'subject_definitions'):
+            prompt = _insert_in_section(prompt, 'subject_definitions',
+                '<Audio 1> exact spoken script (pronunciation only, never visible text):\n' + text)
     return prompt, fingerprint

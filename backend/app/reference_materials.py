@@ -22,10 +22,22 @@ _CHARACTER_USE_RE = re.compile(
     r'(?:主角|讲解员|主持人|主播|人物|角色|男主|女主|男性|女性|男人|女人|男孩|女孩|少年|少女|老人|儿童|这是他|这是她)'
 )
 _EVERY_SHOT_RE = re.compile(
-    r'(?:每(?:一)?(?:张图|个画面|个镜头).{0,12}(?:都|要|需|必须|出现|出镜|使用|有)|'
-    r'(?:所有|全部)(?:图片|图像|画面|镜头).{0,12}(?:都|要|需|必须|出现|出镜|使用|有)|'
-    r'全程.{0,8}(?:出现|出镜|使用|保留))'
+    r'(?:每(?:一)?(?:张(?:图(?:片|像)?|分镜|画面)|个(?:画面|镜头|分镜)|幅(?:图(?:片)?|画面))'
+    r'|(?:所有|全部)(?:图片|图像|画面|镜头|分镜)|全程|贯穿全片)'
+    r'.{0,16}(?:出现|出镜|使用|保留|参考|有她|有他|有该人物)'
 )
+_OPTIONAL_SHOT_RE = re.compile(r'不必|不需要|无需|不用|不要求|不强制|不要|不能|禁止|不是|并非|不一定|未必|可以')
+_LIMITED_SHOT_RE = re.compile(r'(?:只|仅)(?:需|要)?(?:在|限)|(?:只|仅)(?:部分|某些|个别)|按需(?:出现|出镜|使用)|不(?:参考|使用|保留)(?:图中)?人物')
+
+
+def _required_every_shot(description: str) -> bool:
+    # Explicit partial-use restrictions outrank broad wording. Evaluate local
+    # clauses so "每张都出现，不要改变服装" is not treated as a negation.
+    if _LIMITED_SHOT_RE.search(description):
+        return False
+    clauses = re.split(r'[，,。；;！!？?\n]', description)
+    candidates = [clause for clause in clauses if _EVERY_SHOT_RE.search(clause)]
+    return bool(candidates) and not any(_OPTIONAL_SHOT_RE.search(clause) for clause in candidates)
 
 
 def analyze_reference(path: Path) -> dict:
@@ -77,7 +89,7 @@ def material_is_character(row: dict) -> bool:
 def required_every_shot_labels(rows: list[dict] | None = None, *, characters_only: bool = False) -> list[str]:
     rows = reference_metadata() if rows is None else rows
     return [str(row.get('label')) for row in rows
-            if row.get('label') and _EVERY_SHOT_RE.search(str(row.get('description') or ''))
+            if row.get('label') and _required_every_shot(str(row.get('description') or ''))
             and (not characters_only or material_is_character(row))]
 
 
@@ -112,6 +124,38 @@ def request_reference_catalog(request: dict) -> list[dict]:
     return result
 
 
+def explicit_reference_labels(prompt: str) -> set[str]:
+    labels = set()
+    for clause in re.split(r'[。；;\n]', str(prompt or '')):
+        if re.search(r'(?:不|无需|不要|禁止)\s*(?:使用|采用|参考|参照)', clause):
+            continue
+        labels.update('图' + number for number in re.findall(r'(?:参考|参照)(?:图片|图像|图)\s*([1-6])(?!\d)', clause))
+    return labels
+
+
+def recover_visible_character_references(prompt: str, explicit_ids: list[str], story: dict, rows: list[dict]) -> list[str]:
+    """Recover only references tied to a visibly selected character, not semantic context."""
+    people = {str(row.get('label')) for row in rows if row.get('label') and material_is_character(row)}
+    selected = set()
+    for character in story.get('characters', []):
+        if not isinstance(character, dict):
+            continue
+        name = str(character.get('name') or '').strip()
+        if character.get('character_id') not in explicit_ids and not (name and name in prompt):
+            continue
+        appearance = str(character.get('appearance') or '')
+        # The character card, not the whole story, supplies the identity binding.
+        labels = set(re.findall(r'图\s*([1-6])(?!\d)', appearance))
+        candidates = {'图' + number for number in labels} & people
+        if len(candidates) == 1:
+            selected.update(candidates)
+    # An explicit reference instruction in the shot itself is authoritative.
+    for number in re.findall(r'(?:形象|外貌|人物|角色)\s*(?:严格)?\s*参考图\s*([1-6])(?!\d)', prompt):
+        if '图' + number in people:
+            selected.add('图' + number)
+    return [str(row['label']) for row in rows if row.get('label') in selected]
+
+
 def bind_material_references(mapping: list[dict], catalog: dict[str, str]) -> list[dict]:
     """Convert project labels to request-local numbers once; preserve source labels for UI."""
     result = [copy.deepcopy(item) for item in mapping]
@@ -120,6 +164,9 @@ def bind_material_references(mapping: list[dict], catalog: dict[str, str]) -> li
         if item.get('reference_binding_version'):
             continue
         selected = list(dict.fromkeys(item.get('reference_image_ids') or []))
+        missing = (explicit_reference_labels(item.get('image_prompt', '')) & set(catalog)) - set(selected)
+        if missing:
+            raise ValueError('镜头提示词引用了' + '、'.join(sorted(missing)) + '，但没有绑定对应图片，请重新规划或选择参考图')
         if any(label not in catalog for label in selected):
             raise ValueError('镜头选择了不存在的参考图，请重新规划')
         if len(selected) > 3:

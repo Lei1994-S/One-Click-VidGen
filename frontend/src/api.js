@@ -48,6 +48,11 @@ export async function requestJSON(url, options = {}) {
     }
     const error = new Error(readableError(message, `Request failed with ${response.status}`))
     error.status = response.status
+    if (typeof window !== 'undefined' && (
+      message.includes('CLOUD_LOGIN_REQUIRED') ||
+      (response.status === 401 && (message.includes('云端') || message.includes('登录已过期')))
+    )) window.dispatchEvent(new Event('ocv-cloud-login-required'))
+    error.retryAfter = response.headers.get("Retry-After")
     throw error
   }
   return response.json()
@@ -243,6 +248,9 @@ export const api = {
   }),
   saveTtsPause: (id, leftIndex, seconds) => requestJSON(`/api/jobs/${id}/tts-editor/pause`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ left_index: leftIndex, seconds }),
+  }),
+  rebuildTtsAudio: (id, pauses) => requestJSON(`/api/jobs/${id}/tts-editor/rebuild-audio`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pauses }),
   }),
   undoTtsEdit: (id) => requestJSON(`/api/jobs/${id}/tts-editor/undo`, { method: 'POST' }),
   countTtsTokens: (id, texts) => requestJSON(`/api/jobs/${id}/tts-editor/token-count`, {

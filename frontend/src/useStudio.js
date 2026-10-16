@@ -91,13 +91,55 @@ export function useStudio(w) {
     saveDraft()
   }
   function duplicateStudioProject() { return createStudioProjectFromRequest() }
+  async function openCodexDraft(draft) {
+    const id = 'codex-' + draft.id
+    const local = studioDrafts.value.find(row => row.id === id)
+    if (local && !window.confirm('本机已有这份草稿。确定：重新载入 Codex 服务器版本；取消：保留并打开本机编辑。')) {
+      newProject('dynamic', local); return
+    }
+    try {
+      const assets = await api.editorUploads()
+      w.editorAssets.value = assets.assets || []
+      const form = {...JSON.parse(JSON.stringify(creationDefaults)), tts_engine:w.ttsEngine.value, ...draft.parameters,
+        reference_image_ids:draft.parameters.reference_image_ids||[],
+        reference_image_notes:draft.parameters.reference_image_notes||{},
+        reference_image_labels:draft.parameters.reference_image_labels||{},
+        reference_image_kinds:draft.parameters.reference_image_kinds||{},
+        source_audio_id:'', skip_tts:false, dynamic_video:true, dynamic_auto_advance:false, step_mode:true,
+        use_cloud_image_pool:w.form.use_cloud_image_pool, method:w.form.method, size:w.form.size}
+      newProject('dynamic', {id, form, subtitle:{...subtitleDefaults}, engine:form.tts_engine||'indextts25'})
+      studioSaveState.value = 'Codex 草稿已载入并保存到本机；请核对参数后手动生成配音'
+    } catch (e) { studioError.value = e.message }
+  }
+  function openCodexProject(id) {
+    saveDraft(); sessionStorage.setItem('ocv-video-open',id); sessionStorage.removeItem('ocv-video-autoplan')
+    studioPage.value='videos'
+  }
   function resetStudioProject() {
     if (!['failed', 'cancelled', 'completed'].includes(studioJob.value?.status)) return
     if (!window.confirm('重置后将以当前项目参数创建一份未运行草稿；进度、已生成内容和断点不会带入。原项目会保留，可随时返回查看。是否继续？')) return
     return createStudioProjectFromRequest({ reset: true })
   }
   const studioPage = ref('home'), studioTab = ref('文案'), studioDrawer = ref('')
+  let servicesReturnPage = 'home'
+  function closeServices(){studioPage.value=servicesReturnPage}
+  watch(studioDrawer, value=>{if(value==='接口与服务'){servicesReturnPage=studioPage.value==='services'?servicesReturnPage:studioPage.value;saveDraft();studioDrawer.value='';studioPage.value='services'}},{flush:'sync'})
   const studioKind = ref('video'), studioError = ref(''), studioBusy = ref(false)
+  const codexBridgeAvailable = ref(false)
+  watch(()=>[w.session.value.user?.id, studioPage.value], async()=>{
+    try { await requestJSON('/api/codex-bridge/info'); codexBridgeAvailable.value=true }
+    catch { codexBridgeAvailable.value=false }
+  }, {immediate:true})
+  async function handoffToCodex() {
+    if (studioBusy.value || !studioJob.value?.id) return
+    if (!window.confirm('请确认配音与字幕已核查。将保存现有配音并交给 Codex 规划，不运行自动分镜、不生成图片或视频。')) return
+    studioBusy.value=true; studioError.value=''
+    try {
+      const result=await requestJSON('/api/codex-bridge/from-audio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_id:studioJob.value.id,audio_confirmed:true})})
+      openCodexProject(result.id)
+    } catch(e) { studioError.value=e.message }
+    finally { studioBusy.value=false }
+  }
   const dynamicAudioProjectId = ref(''), dynamicAudioBaselineRevision = ref(0)
   const editingDynamicAudio = computed(()=>Boolean(dynamicAudioProjectId.value))
   function clearDynamicAudioContext(){dynamicAudioProjectId.value='';dynamicAudioBaselineRevision.value=0;sessionStorage.removeItem('ocv-video-audio-edit')}
@@ -117,7 +159,21 @@ export function useStudio(w) {
   const studioLiveJobs = computed(()=>w.jobs.value.filter(j=>['queued','running'].includes(j.status)))
   const studioJobs = computed(()=>w.jobs.value.filter(j=>(studioFilter.value==='all'||typeOf(j)===studioFilter.value)&&String(j.request?.project_name||j.id).toLowerCase().includes(studioSearch.value.toLowerCase())))
   const studioTabs = computed(()=>studioKind.value==='audio'?['文案','配音','导出','参数回顾']:studioKind.value==='subtitle'?['素材','字幕','导出','参数回顾']:['文案','配音','画面与字幕','导出','参数回顾'])
-  const studioSelectedImage = computed(()=>w.visualEditor.value.items.find(i=>i.id===w.visualTimingSelectedId.value)||w.visualEditor.value.items[0])
+  const studioSceneAssets=ref([])
+  let scenePoll=null
+  async function refreshSceneAssets(){
+    const id=w.visualEditorProjectId.value
+    if(!id)return
+    try{const data=await requestJSON(`/api/jobs/${id}/scene-assets`);if(id!==w.visualEditorProjectId.value)return
+      studioSceneAssets.value=(data.items||[]).map((item,index)=>{
+        const old=studioSceneAssets.value.find(row=>row.id===item.id)
+        return Object.assign(old||{},item,{is_scene:true,display_name:`场景 ${index+1} · ${item.name}`,reference_materials:item.references||[],prompt:old?.prompt??item.prompt,image_url:item.image_url+'?v='+encodeURIComponent(item.task?.updated_at||0),text:'场景参考，不占用视频时长',timing:{}})
+      })
+    }catch{}
+  }
+  watch(()=>w.visualEditorProjectId.value,()=>{studioSceneAssets.value=[];clearInterval(scenePoll);refreshSceneAssets();scenePoll=setInterval(refreshSceneAssets,4000)},{immediate:true})
+  onBeforeUnmount(()=>clearInterval(scenePoll))
+  const studioSelectedImage = computed(()=>studioSceneAssets.value.find(i=>i.id===w.visualTimingSelectedId.value)||w.visualEditor.value.items.find(i=>i.id===w.visualTimingSelectedId.value)||w.visualEditor.value.items[0])
   const studioSelectedImageIndex = computed(()=>w.visualEditor.value.items.findIndex(i=>i.id===studioSelectedImage.value?.id))
   const canSelectPreviousImage = computed(()=>studioSelectedImageIndex.value>0)
   const canSelectNextImage = computed(()=>studioSelectedImageIndex.value>=0&&studioSelectedImageIndex.value<w.visualEditor.value.items.length-1)
@@ -125,7 +181,7 @@ export function useStudio(w) {
     const index=studioSelectedImageIndex.value+Number(offset||0),item=w.visualEditor.value.items[index]
     if(item)w.visualTimingSelectedId.value=item.id
   }
-  const studioAudio = computed(()=>studioJob.value?.artifacts?.audio||'')
+  const studioAudio = computed(()=>{const url=studioJob.value?.artifacts?.audio||'';return url?`${url}${url.includes('?')?'&':'?'}tts_revision=${Number(w.ttsEditor.value?.revision||0)}`:''})
   const studioVideo = computed(() => {
     const url = studioJob.value?.artifacts?.video_with_subtitles
       || studioJob.value?.artifacts?.video_raw
@@ -186,7 +242,7 @@ export function useStudio(w) {
     saveDraft();draftLoading=true;studioKind.value=kind;studioDraftId.value=draft?.id||`draft-${Date.now()}`;studioPage.value='new';studioProjectId.value='';studioError.value='';studioDrawer.value='';studioTab.value=kind==='subtitle'?'素材':'文案';w.activePage.value=kind==='audio'?'module1':kind==='subtitle'?'subtitle':'workspace';w.followLiveJob.value=false
     for(const key of ['_rerun_source_project','_rerun_source_revision','_rerun_base','_rerun_base_engine','_rerun_tts_baseline','_rerun_stages','_rerun_return_view','_return_dynamic_stage'])delete w.form[key]
     w.form.reference_image_ids=[];w.form.protagonist_reference_image_id=''
-    w.form.reference_image_notes={};w.form.reference_image_labels={};w.form.reference_image_kinds={}
+    w.form.reference_image_notes={};w.form.reference_image_labels={};w.form.reference_image_kinds={};w.form.presenter_mode=false;w.form.presenter_reference_id=''
     w.referenceImageNames.value=[];w.protagonistReferenceImageError.value=''
     if(draft){
       const autoAnalyze=w.form.auto_analyze_reference_images;Object.assign(w.form,draft.form)
@@ -229,8 +285,10 @@ export function useStudio(w) {
       const existing=await requestJSON('/api/video-studio/by-audio-task/'+encodeURIComponent(studioJob.value.id))
       if(existing.project){
         if(sessionStorage.getItem('ocv-video-audio-edit')===existing.project.id){
-          const audioChanged=Number(w.ttsEditor.value?.revision||0)!==Number(dynamicAudioBaselineRevision.value||0)
-          if(audioChanged)await requestJSON('/api/video-studio/'+existing.project.id+'/sync-audio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:existing.project.revision})})
+          // Always ask the backend to compare the canonical audio/SRT files.
+          // Revision-only gating missed recovered or migrated TTS edits whose
+          // manifest revision happened to match the value loaded on entry.
+          await requestJSON('/api/video-studio/'+existing.project.id+'/sync-audio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:existing.project.revision})})
           sessionStorage.removeItem('ocv-video-audio-edit')
         }
         sessionStorage.setItem('ocv-video-open',existing.project.id)
@@ -306,9 +364,9 @@ export function useStudio(w) {
         const changed=key=>JSON.stringify(w.form[key]??null)!==JSON.stringify(base[key]??null)
         const ttsChanged=JSON.stringify(rerunTtsSnapshot())!==JSON.stringify(w.form._rerun_tts_baseline||rerunTtsSnapshot())
         if(!ttsChanged){
-          const visualKeys=['visual_pacing_preset','visual_min_duration','visual_target_duration','visual_max_duration','visual_max_slides','image_profile_id','image_resolution','visual_backend','video_orientation','video_render_variant','subtitle_font','subtitle_size','subtitle_color','subtitle_outline_color','subtitle_outline_width','subtitle_position','subtitle_margin_bottom']
+          const visualKeys=['dynamic_max_shot_duration','method','size','use_cloud_image_pool','visual_pacing_preset','visual_min_duration','visual_target_duration','visual_max_duration','visual_max_slides','image_profile_id','image_resolution','visual_backend','video_orientation','video_render_variant','subtitle_font','subtitle_size','subtitle_color','subtitle_outline_color','subtitle_outline_width','subtitle_position','subtitle_margin_bottom']
           const parameters={};for(const key of visualKeys)if(Object.hasOwn(w.form,key)&&changed(key))parameters[key]=w.form[key]
-          const payload={revision:Number(w.form._rerun_source_revision||0),name:w.form.project_name||'',style:w.form.visual_style_prompt||'',characters:w.form.global_character_prompt||'',world:w.form.story_environment_prompt||'',dynamic_text_mode:w.form.dynamic_text_mode||'visual_first',scene_references_enabled:w.form.scene_references_enabled!==false,video_generation_backend:w.form.video_generation_backend||'api',comfyui_profile_id:w.form.comfyui_profile_id||'',comfyui_h3_prompt_agent:Boolean(w.form.comfyui_h3_prompt_agent),comfyui_reference_audio:Boolean(w.form.comfyui_reference_audio),dynamic_auto_advance:Boolean(w.form.dynamic_auto_advance),parameters}
+          const payload={revision:Number(w.form._rerun_source_revision||0),name:w.form.project_name||'',style:w.form.visual_style_prompt||'',characters:w.form.global_character_prompt||'',world:w.form.story_environment_prompt||'',dynamic_text_mode:w.form.dynamic_text_mode||'visual_first',scene_references_enabled:w.form.scene_references_enabled!==false,video_generation_backend:w.form.video_generation_backend||'api',comfyui_profile_id:w.form.comfyui_profile_id||'',comfyui_h3_prompt_agent:Boolean(w.form.comfyui_h3_prompt_agent),comfyui_reference_audio:Boolean(w.form.comfyui_reference_audio),presenter_mode:Boolean(w.form.presenter_mode),presenter_reference_id:w.form.presenter_reference_id||'',dynamic_auto_advance:Boolean(w.form.dynamic_auto_advance),parameters}
           const updated=await requestJSON('/api/video-studio/'+encodeURIComponent(sourceId)+'/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
           if(updated.status==='draft'&&!updated.shots?.length)sessionStorage.setItem('ocv-video-autoplan',sourceId)
           studioDrafts.value=studioDrafts.value.filter(d=>d.id!==studioDraftId.value);localStorage.setItem(storageKey(),JSON.stringify(studioDrafts.value))
@@ -411,5 +469,5 @@ export function useStudio(w) {
     try{const result=await api.insertVisualTimingPicture(w.visualEditorProjectId.value,item.id,sentence.slide_id);w.visualEditor.value=result;w.hydrateVisualSubtitleDrafts({preserveDirty:false});const added=result.items.find(row=>row.id.startsWith('poster_added_')&&row.slides?.includes(sentence.slide_id));w.visualTimingSelectedId.value=added?.id||item.id;w.visualEditor.value.task={status:'completed',action:'timing_insert',message:'黑色占位画面已加入并选中；现在可以填写提示词重绘、上传参考图或替换本地图片。'}}
     catch(e){w.visualEditor.value.task={status:'failed',action:'timing_insert',message:e.message||'添加画面失败'}}finally{visualPictureInsertBusy.value=false}
   }
-return {openDynamicAudio,enterDynamicStoryboard,editingDynamicAudio,restoreDefaultsOnNewProject,duplicateStudioProject,resetStudioProject,studioDraftsExpanded,visibleStudioDrafts,deleteStudioDraft,clearStudioDrafts,studioPage,studioTab,studioDrawer,studioKind,studioError,studioBusy,studioSearch,studioFilter,studioSentence,studioLogsOpen,studioSaveState,studioDrafts,studioJobs,studioJob,studioLiveJobs,studioTabs,studioSelectedImage,studioSelectedImageIndex,canSelectPreviousImage,canSelectNextImage,selectAdjacentVisualImage,studioAudio,studioVideo,studioTaskLogs,studioReferenceAssets,studioTitle,studioHasRunning,typeOf,typeLabel,goHome,newProject,openProject,launch,changeStudioPage,openLogs,refreshEditorData,reconnectStudio,chooseTab,studioSubtitles,studioSubtitleMessage,exportStudioSubtitles,visualSubtitleSplitDialog,visualPictureInsertBusy,openVisualSubtitleSplit,closeVisualSubtitleSplit,playVisualSubtitleSplitRange,applyVisualSubtitleSplit,insertVisualPicture}
+return {studioSceneAssets,codexBridgeAvailable,handoffToCodex,openCodexDraft,openCodexProject,closeServices,openDynamicAudio,enterDynamicStoryboard,editingDynamicAudio,restoreDefaultsOnNewProject,duplicateStudioProject,resetStudioProject,studioDraftsExpanded,visibleStudioDrafts,deleteStudioDraft,clearStudioDrafts,studioPage,studioTab,studioDrawer,studioKind,studioError,studioBusy,studioSearch,studioFilter,studioSentence,studioLogsOpen,studioSaveState,studioDrafts,studioJobs,studioJob,studioLiveJobs,studioTabs,studioSelectedImage,studioSelectedImageIndex,canSelectPreviousImage,canSelectNextImage,selectAdjacentVisualImage,studioAudio,studioVideo,studioTaskLogs,studioReferenceAssets,studioTitle,studioHasRunning,typeOf,typeLabel,goHome,newProject,openProject,launch,changeStudioPage,openLogs,refreshEditorData,reconnectStudio,chooseTab,studioSubtitles,studioSubtitleMessage,exportStudioSubtitles,visualSubtitleSplitDialog,visualPictureInsertBusy,openVisualSubtitleSplit,closeVisualSubtitleSplit,playVisualSubtitleSplitRange,applyVisualSubtitleSplit,insertVisualPicture}
 }

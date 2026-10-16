@@ -18,12 +18,14 @@ __pycache__/
 !.env.example
 .cloud_sessions.json
 .cloud_sessions.json.tmp
+.cloud_sessions.json.lock
 
 node_modules/
 frontend/node_modules/
 frontend/dist/
 
 workspace/
+models/
 runtime/
 runtime_logs/
 Archives/
@@ -42,6 +44,9 @@ tools/*
 !tools/portable_release_audit.py
 !tools/publish_launcher_release.py
 !tools/deploy_indextts25.ps1
+!tools/build_comfyui_component.py
+!tools/validate_comfyui_component.py
+!tools/prepare_model_library.py
 Sound Material/
 测试文案/
 venv_audio_vedio/
@@ -79,3 +84,16 @@ launcher/ui-preview.png
 /更新日志_*.md
 /launcher/UPDATE_SOURCE_INTEGRATION.md
 /deploy/content_guard/
+
+# Maintainer-only optional director content.
+/plugins/private_*/
+
+# Local redistribution review bundle; never publish implicitly.
+/local_integration_bundle_*/
+
+# Optional component binaries and third-party nodes are distributed separately.
+/comfyui/*
+!/comfyui/README.md
+/tts/*
+!/tts/README.md
+!tools/migrate_optional_components.ps1

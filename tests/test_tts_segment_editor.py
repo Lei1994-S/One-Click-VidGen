@@ -29,6 +29,20 @@ def write_silent_wav(path: Path, duration: float, sample_rate: int = 16000) -> N
 
 
 class TtsSegmentEditorTest(unittest.TestCase):
+    def test_hidden_cues_remain_in_full_timeline_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            other = project / 'other'
+            other.mkdir()
+            rows = [{'text_content': '可见句', 'start': 0, 'end': 1},
+                    {'text_content': '隐藏句', 'start': 1, 'end': 2, 'subtitle_hidden': True}]
+            (other / '画面时间线.json').write_text(json.dumps(rows), encoding='utf-8')
+            (other / '最终字幕.srt').write_text('1\n00:00:00,000 --> 00:00:01,000\n可见句\n', encoding='utf-8')
+            _commit_canonical_subtitle_timeline(project)
+            result = json.loads((other / '画面时间线.json').read_text(encoding='utf-8'))
+            self.assertEqual([r['text_content'] for r in result], ['可见句', '隐藏句'])
+            self.assertEqual([r['text'] for r in _srt_entries(other / '最终字幕.srt')], ['可见句'])
+
     def test_status_revision_reads_persisted_boundary_version(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -234,6 +248,38 @@ class TtsSegmentEditorTest(unittest.TestCase):
                 self.assertEqual(float(restored["segments"][0].get("pause_after") or 0), 0)
                 with wave.open(str(project / "input" / "配音.wav"), "rb") as audio:
                     self.assertAlmostEqual(audio.getnframes() / audio.getframerate(), 2.0, places=2)
+
+    def test_rebuild_applies_multiple_pauses_in_one_history_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            segment_dir = project / 'other' / 'tts_segments'
+            segment_dir.mkdir(parents=True)
+            (project / 'input').mkdir()
+            segments = []
+            for i in range(1, 4):
+                filename = f'segment_{i:04d}.wav'
+                write_silent_wav(segment_dir / filename, 1.0)
+                segments.append(dict(index=i, text=f'句{i}', filename=filename, start=i-1, end=i, duration=1))
+            (segment_dir / 'manifest.json').write_text(json.dumps({'segments': segments}), encoding='utf-8')
+            (project / 'other' / '最终字幕.srt').write_text('1\n00:00:00,000 --> 00:00:01,000\n句1\n\n2\n00:00:01,000 --> 00:00:02,000\n句2\n\n3\n00:00:02,000 --> 00:00:03,000\n句3\n', encoding='utf-8')
+            _concat_wavs([segment_dir / s['filename'] for s in segments], project / 'input' / '配音.wav')
+            editor = TtsEditor()
+            job = SimpleNamespace(id='job', request={}, user_id=1)
+            with (patch.object(editor, '_project_dir', return_value=project),
+                  patch.object(editor, '_ensure_module1_layout'),
+                  patch.object(editor, '_migrate_legacy_archive'),
+                  patch.object(editor, '_apply_boundary_delta', wraps=editor._apply_boundary_delta) as shift,
+                  patch('backend.app.tts_editor.store.log')):
+                result = editor.rebuild_audio(job=job, user_id=1, pauses={1: 0.5, 2: 0.8})
+                self.assertEqual(result['history_count'], 1)
+                self.assertEqual([c.args[1:] for c in shift.call_args_list], [(2.0, 0.8), (1.0, 0.5)])
+                with wave.open(str(project / 'input' / '配音.wav'), 'rb') as audio:
+                    self.assertAlmostEqual(audio.getnframes() / audio.getframerate(), 4.3, places=2)
+                updated = json.loads((segment_dir / 'manifest.json').read_text(encoding='utf-8'))
+                self.assertAlmostEqual(updated['segments'][2]['start'], 3.3)
+                editor.undo(job=job, user_id=1)
+                with wave.open(str(project / 'input' / '配音.wav'), 'rb') as audio:
+                    self.assertAlmostEqual(audio.getnframes() / audio.getframerate(), 3.0, places=2)
 
     def test_structural_split_revoices_two_parts_and_is_undoable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

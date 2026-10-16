@@ -1,17 +1,15 @@
 {
-  "release_id": "2026.09.27.2",
-  "release_order": 2026092702,
-  "display_version": "2026.09.27 号池开关记忆修复",
+  "release_id": "2026.10.16.2",
+  "release_order": 2026101602,
+  "display_version": "2026.10.16 H3 2K 与生成链路修复",
   "branch": "main",
   "portable_overlay_safe": true,
   "portable_overlay_min_order": 2026081801,
   "archive_url": "https://github.com/IFRIT-Zhou/One-Click-VidGen/archive/refs/heads/main.zip",
   "archive_urls": [
-    "https://download.oneclickvidgen.com/releases/2026.09.27.2/One-Click-VidGen-main.zip",
-    "https://modelscope.cn/models/IFRIT95/One-Click-VidGen-Update-Mirror/resolve/master/releases/2026.09.27.2/One-Click-VidGen-main.zip",
     "https://github.com/IFRIT-Zhou/One-Click-VidGen/archive/refs/heads/main.zip"
   ],
   "archive_sha256": "",
-  "notes": "修复号池开关刷新或重开页面后恢复关闭的问题；用户选择保存到当前浏览器，打开历史任务、切换阶段及加载预设不再覆盖全局号池开关。进入画面生成仍使用当前开关状态，不会因切换或恢复开关自动重跑或扣费。包含此前配音续跑与动态分镜语义修复。",
-  "content_fingerprint": "32fc72e44b9dbf4f5bc4cb542d43c8e58e8c5c5c2547e2feed671ccad19b513f"
+  "notes": "H3默认原生2K，按10秒上限拆分并校验；修复RunningHub上传filename字段兼容、分镜确认丢失单镜通道和尺寸、分步设置漏存；2K H3成片导出保持2K。保留旧任务与素材，不自动重新生成。",
+  "content_fingerprint": "0bcb7cb769d6d89feb34e8d6b38c22a4d9cca9934d96448cbc59d6043c1517ab"
 }

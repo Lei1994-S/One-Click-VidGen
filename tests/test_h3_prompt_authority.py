@@ -1,0 +1,93 @@
+import json
+import re
+import unittest
+from unittest.mock import patch
+
+from backend.app import h3_prompt_agent as agent
+
+
+INLINE = ('subject_definitions: <Picture 1> is the visual reference. '
+          'summary: A white-robed man watches clouds. '
+          'retention_analysis: Preserve compatible landscape details from <Picture 1>. '
+          'detailed_description: [Shot 1] [00:00-00:10] The white-robed man stays still '
+          'on the mountain while the camera slowly pushes closer and clouds drift. '
+          'overall_soundscape: Wind. non_diegetic_music: N/A.')
+
+
+class H3PromptAuthorityTests(unittest.TestCase):
+    def test_invented_case_label_is_corrected_without_changing_source(self):
+        bad = INLINE.replace('The white-robed man stays still', '标签显示“病例 01”。 The white-robed man stays still')
+        shot = {'video_prompt': 'Three blank cards appear.'}
+        with patch.object(agent, 'generate_gemini_text', side_effect=[json.dumps({'h3_prompt': bad}), json.dumps({'h3_prompt': INLINE})]) as generate:
+            prompt, _ = agent.convert_for_h3(shot, 10)
+        self.assertEqual(generate.call_count, 2)
+        self.assertNotIn('病例 01', prompt)
+        self.assertIn('Cards may remain blank', generate.call_args.kwargs['system_prompt'])
+        self.assertEqual(shot, {'video_prompt': 'Three blank cards appear.'})
+
+    def test_invented_case_label_repair_remains_bounded(self):
+        bad = INLINE.replace('The white-robed man stays still', '标签显示“病例 01”。 The white-robed man stays still')
+        with patch.object(agent, 'generate_gemini_text', return_value=json.dumps({'h3_prompt': bad})) as generate:
+            with self.assertRaisesRegex(ValueError, '尚未提交视频生成'):
+                agent.convert_for_h3({'video_prompt': 'Three blank cards.'}, 10)
+        self.assertEqual(generate.call_count, 3)
+
+    def test_invalid_json_retries_same_inputs_then_succeeds(self):
+        with patch.object(agent, 'generate_gemini_text', side_effect=['{"h3_prompt" "broken"}', json.dumps({'h3_prompt': INLINE})]) as generate:
+            prompt, _ = agent.convert_for_h3({'video_prompt': 'Approved scene.'}, 10)
+        self.assertIn('white-robed man', prompt)
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(generate.call_args_list[0].kwargs['user_prompt'], generate.call_args_list[1].kwargs['user_prompt'])
+
+    def test_format_retry_is_bounded_and_does_not_mutate_shot(self):
+        shot = {'video_prompt': 'Approved scene.'}
+        with patch.object(agent, 'generate_gemini_text', return_value='{"h3_prompt" "broken"}') as generate:
+            with self.assertRaisesRegex(ValueError, '已自动重试 2 次.*尚未提交 ComfyUI'):
+                agent.convert_for_h3(shot, 10)
+        self.assertEqual(generate.call_count, 3)
+        self.assertEqual(shot, {'video_prompt': 'Approved scene.'})
+
+    def test_semantic_error_is_not_retried(self):
+        with patch.object(agent, 'generate_gemini_text', return_value=json.dumps({'h3_prompt': INLINE + ' summary: Duplicate.'})) as generate:
+            with self.assertRaisesRegex(ValueError, '重复'):
+                agent.convert_for_h3({'video_prompt': 'Approved scene.'}, 10)
+        self.assertEqual(generate.call_count, 1)
+
+    def test_inline_sections_preserve_real_bodies_without_placeholders(self):
+        result = agent._validate(INLINE, 10)
+        for name in agent._SECTIONS:
+            self.assertEqual(len(re.findall(rf'(?m)^\s*{name}:', result)), 1)
+        self.assertIn('white-robed man stays still', agent._section_body(result, 'detailed_description'))
+        self.assertNotIn('The approved action unfolds continuously', result)
+        self.assertEqual(agent._validate(result, 10), result)
+
+    def test_duplicate_sections_fail_before_gpu_submission(self):
+        with self.assertRaisesRegex(ValueError, '重复'):
+            agent._validate(INLINE + ' summary: Another design.', 10)
+
+    def test_manual_video_prompt_is_only_creative_text_sent(self):
+        shot = {'video_prompt': '白衣男子静立山巅，镜头缓慢推近。',
+                'intent': '古今左右分屏', 'action': '庄子持钓竿',
+                'image_prompt': '灰褐色旧衣', 'motion_plan': {}}
+        with patch.object(agent, 'generate_gemini_text', return_value=json.dumps({'h3_prompt': INLINE})) as generate:
+            agent.convert_for_h3(shot, 10)
+        payload = json.loads(generate.call_args.kwargs['user_prompt'])
+        self.assertEqual(payload['model_neutral_video_prompt'], shot['video_prompt'])
+        for key in ('storyboard_intent', 'approved_dynamic_expression', 'core_image_prompt_for_context'):
+            self.assertNotIn(key, payload)
+        for stale in ('古今左右分屏', '庄子持钓竿', '灰褐色旧衣'):
+            self.assertNotIn(stale, generate.call_args.kwargs['user_prompt'])
+        self.assertIn('sole approved creative instruction', generate.call_args.kwargs['system_prompt'])
+        self.assertIn('one [Shot 1]', generate.call_args.kwargs['system_prompt'])
+
+    def test_final_prompt_changes_invalidate_cache(self):
+        shot = {'video_prompt': 'A white-robed man.'}
+        before = agent.source_fingerprint(shot, 10)
+        shot['action'] = 'Outdated fishing action'
+        self.assertEqual(before, agent.source_fingerprint(shot, 10))
+        shot['video_prompt'] = 'Clouds only.'
+        self.assertNotEqual(before, agent.source_fingerprint(shot, 10))
+
+
+if __name__ == '__main__':
+    unittest.main()
