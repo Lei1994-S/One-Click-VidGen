@@ -71,6 +71,24 @@ class CodexBridgeTests(unittest.TestCase):
         self.assertEqual((self.path/'record.json').read_bytes(), before)
         self.assertFalse((self.path/'codex_bridge_backups').exists())
 
+    def test_ai_guide_matches_mcp_and_preserves_native_access_gate(self):
+        from plugins.codex_bridge.ocv_mcp.guidance import read_guide
+        before = (self.path/'record.json').read_bytes()
+        info = self.client.get('/api/codex-bridge/info').json()
+        response = self.client.get(info['ai_guide_url'])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), read_guide('start'))
+        self.assertEqual(Path(info['ai_guide_path']).read_text(encoding='utf-8-sig'), read_guide('all')['content'])
+        self.assertEqual(self.client.get(info['ai_guide_url'], params={'topic': 'audio'}).json(), read_guide('audio'))
+        self.assertEqual(self.client.get(info['ai_guide_url'], params={'topic': '../.env'}).status_code, 422)
+        with patch.object(bridge, 'enabled', return_value=False):
+            self.assertEqual(self.client.get(info['ai_guide_url']).status_code, 404)
+        with patch.object(bridge, 'require_user', side_effect=HTTPException(401, 'login')):
+            self.assertEqual(self.client.get(info['ai_guide_url']).status_code, 401)
+        with patch.object(bridge, 'PROJECT_ROOT', self.root):
+            self.assertEqual(self.client.get(info['ai_guide_url']).status_code, 404)
+        self.assertEqual((self.path/'record.json').read_bytes(), before)
+
     def test_apply_backup_readback_idempotency_no_generation(self):
         result = self.client.post(self.endpoint('apply'), json=self.payload).json()
         self.assertTrue(result['written']); self.assertFalse(result['generation_started'])
@@ -201,6 +219,46 @@ class CodexBridgeTests(unittest.TestCase):
         payload = {'id': 'b'*32, 'parameters': {'project_name': '新项目', 'script': '文案', 'reference_image_ids': ['missing']}}
         with patch.object(main, 'list_uploads', return_value=[]):
             self.assertEqual(self.client.put('/api/codex-bridge/drafts', json=payload).status_code, 422)
+
+    def test_draft_schema_declares_writable_and_server_managed_fields(self):
+        from backend.app.main import GenerateRequest
+        result = self.client.get('/api/codex-bridge/schema').json()
+        schema = result['draft']['properties']['parameters']
+        self.assertEqual(set(schema['properties']), bridge.DRAFT_FIELDS)
+        self.assertFalse(schema['additionalProperties'])
+        self.assertEqual(schema['required'], ['project_name', 'script'])
+        self.assertEqual(schema['properties']['script']['maxLength'], 12000)
+        self.assertEqual(schema['properties']['content_mode']['default'], 'general')
+        native = GenerateRequest.model_json_schema()['properties']
+        for key in bridge.DRAFT_FIELDS - {'project_name', 'script', 'content_mode'}:
+            self.assertEqual(schema['properties'][key], native[key])
+        self.assertEqual(result['draft_server_managed_fields'], bridge.DRAFT_SERVER_PARAMETERS)
+        for key, value in bridge.DRAFT_SERVER_PARAMETERS.items():
+            self.assertNotIn(key, schema['properties'])
+            self.assertEqual(schema['x-server-managed-fields'][key]['const'], value)
+            self.assertTrue(schema['x-server-managed-fields'][key]['readOnly'])
+
+    def test_server_managed_draft_fields_rejected_even_when_value_matches(self):
+        from backend.app import main
+        payload = {'id': 'b'*32, 'parameters': {'project_name': '新项目', 'script': '完整文案'}}
+        with patch.object(main, 'list_uploads', return_value=[]):
+            saved = self.client.put('/api/codex-bridge/drafts', json=payload).json()
+            path = bridge.draft_path(1, payload['id']) / 'record.json'
+            before = path.read_bytes()
+            for key, value in bridge.DRAFT_SERVER_PARAMETERS.items():
+                self.assertEqual(saved['parameters'][key], value)
+                for submitted in (value, not value):
+                    with self.subTest(key=key, value=submitted):
+                        request = {**payload, 'revision': 1,
+                                   'parameters': {**payload['parameters'], key: submitted}}
+                        result = self.client.put('/api/codex-bridge/drafts', json=request)
+                        self.assertEqual(result.status_code, 422)
+                        self.assertIn('服务端自动设置', result.json()['detail'])
+                        self.assertEqual(path.read_bytes(), before)
+            # Native edit/revision behavior is unchanged for declared inputs.
+            payload['revision'] = saved['revision']
+            payload['parameters']['script'] = '修改后的完整文案'
+            self.assertEqual(self.client.put('/api/codex-bridge/drafts', json=payload).json()['revision'], 2)
 
     def test_from_audio_requires_confirmation_and_reuses_existing(self):
         self.assertEqual(self.client.post('/api/codex-bridge/from-audio', json={'job_id': 'audio'}).status_code, 422)

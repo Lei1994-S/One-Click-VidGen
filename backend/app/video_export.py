@@ -13,7 +13,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from .subtitle_layout import normalize as normalize_layout, write_ass
 
 from . import video_studio as studio
@@ -25,6 +25,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class ExportRequest(BaseModel):
+    intro_video_id: str | None = Field(default=None, max_length=180)
+    outro_video_id: str | None = Field(default=None, max_length=180)
     revision: int
     use_video_audio: bool = True
     subtitle_layouts: dict | None = None
@@ -151,6 +153,10 @@ def _asset(path: Path, relative: str) -> Path:
 
 
 def _source(path, shot):
+    dependency=(shot.get('video_request') or {}).get('transition_source')
+    if shot.get('kind')=='video' and dependency is not None:
+        from .vibe_transition_source import validate
+        validate(path,shot['id'],dependency)
     relative = shot.get('video') if shot.get('kind') == 'video' else shot.get('image')
     if not relative:
         raise ValueError(f'镜头 {shot.get("id")} 缺少{"视频" if shot.get("kind") == "video" else "图片"}资产')
@@ -192,7 +198,18 @@ def _subtitle_style(record, height):
             f"Outline={float(defaults['outline']):g},Shadow=0")
 
 
+def _vibe_export_issue(record):
+    for index, shot in enumerate(record.get('shots', ()), 1):
+        if shot.get('vibe_reserved'):
+            return f'第 {index:02d} 镜已预留 Vibe 动效，请先预览并采用，或取消预留；不会按静图导出'
+        if studio.has_vibe_output(shot) and (shot.get('audio_timing_adjustment') or {}).get('needs_review'):
+            return f'第 {index:02d} 镜的配音或字幕时间轴已变，请先试看并确认沿用，或重新预览并采用 Vibe 动效'
+    return None
+
+
 def _render(path, record):
+    if issue := _vibe_export_issue(record):
+        raise ValueError(issue)
     path = path.resolve()
     output_root = PROJECT_ROOT / 'output' / (_safe_name(record['settings'].get('name')) + '_动态视频')
     work = path / 'export_work'
@@ -202,11 +219,14 @@ def _render(path, record):
     output_root.mkdir(parents=True, exist_ok=True)
     clips = []
     use_video_audio = bool((record.get('export_settings') or {}).get('use_video_audio', True))
+    has_kept_audio = False
     layout = presentation(record)
     base_vf = frame_filter(layout)
+    from .final_narration import visual_playback_range
+    narration_duration = probe_media_duration(_asset(path, record['audio']))
     for index, shot in enumerate(record['shots'], 1):
         source = _source(path, shot)
-        duration = float(shot['end']) - float(shot['start'])
+        duration = visual_playback_range(record['shots'], index-1, narration_duration)['duration']
         clip = work / f'{index:04d}.mp4'
         command = [ffmpeg_binary(), '-y']
         if shot['kind'] == 'static':
@@ -226,8 +246,12 @@ def _render(path, record):
             if duration > source_duration + 0.03:
                 stretch = duration / source_duration
                 vf = f'setpts={stretch:.9f}*PTS,{base_vf}'
-        keep_source_audio = bool(use_video_audio and shot['kind'] == 'video' and _has_audio_stream(source))
+        from .presenter_mode import presenter_requested
+        keep_source_audio = bool(use_video_audio and shot['kind'] == 'video' and not studio.has_vibe_output(shot)
+                                 and not presenter_requested(record.get('creation_parameters', {}), shot, record.get('references', []))
+                                 and _has_audio_stream(source))
         if keep_source_audio:
+            has_kept_audio = True
             audio_filter = 'aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo'
             if duration > source_duration + 0.03:
                 tempo = source_duration / duration
@@ -241,25 +265,31 @@ def _render(path, record):
         else:
             command += ['-f', 'lavfi', '-t', f'{duration:.3f}', '-i', 'anullsrc=r=48000:cl=stereo',
                         '-map', '0:v:0', '-map', '1:a:0']
-        command += ['-t', f'{duration:.3f}', '-vf', vf, '-c:v', 'libx264', '-preset', 'fast',
+        # overlay/fps can drop the final decoded image at EOF (e.g. 29 out
+        # of 30 frames for an exact 1 s clip). Pad just the boundary then trim.
+        command += ['-t', f'{duration:.3f}', '-vf', vf + ',tpad=stop_mode=clone:stop_duration=0.1', '-c:v', 'libx264', '-preset', 'fast',
                     '-crf', '18', '-pix_fmt', 'yuv420p', '-r', '30', '-c:a', 'aac', '-b:a', '192k', str(clip)]
         _run(command, f'第 {index} 镜标准化')
         clips.append(clip)
     concat = work / 'concat.txt'
     concat.write_text('\n'.join("file '" + clip.as_posix().replace("'", "'\\''") + "'" for clip in clips), encoding='utf-8')
     assembled = work / 'assembled.mp4'
-    _run([ffmpeg_binary(), '-y', '-f', 'concat', '-safe', '0', '-i', str(concat), '-c', 'copy', str(assembled)], '镜头拼接')
+    concat_streams = [] if has_kept_audio else ['-map','0:v:0']
+    _run([ffmpeg_binary(), '-y', '-f', 'concat', '-safe', '0', '-i', str(concat), *concat_streams, '-c', 'copy', str(assembled)], '镜头拼接')
     audio = _asset(path, record['audio'])
     raw = output_root / '最终视频_纯净版.mp4'
-    if use_video_audio:
+    # Normalizing two amix inputs attenuates narration even when the first
+    # input is pure, synthetic silence. Vibe and stills use the actual master.
+    if has_kept_audio:
         mix = ('[0:a:0]volume=0.65[effects];[1:a:0]volume=1.0[narration];'
                '[effects][narration]amix=inputs=2:duration=first:dropout_transition=0,'
                'alimiter=limit=0.95[mixed]')
         audio_args = ['-filter_complex', mix, '-map', '0:v:0', '-map', '[mixed]']
     else:
         audio_args = ['-map', '0:v:0', '-map', '1:a:0']
+    end_args = ['-shortest'] if has_kept_audio else ['-t',f'{narration_duration:.6f}']
     _run([ffmpeg_binary(), '-y', '-i', str(assembled), '-i', str(audio), *audio_args,
-          '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart', str(raw)], '配音与音效合成')
+          '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', *end_args, '-movflags', '+faststart', str(raw)], '配音与音效合成')
     srt = _asset(path, record.get('subtitles', 'assets/subtitles.srt'))
     shutil.copy2(srt, output_root / '最终字幕.srt')
     subtitled = output_root / '最终视频_字幕版.mp4'
@@ -269,10 +299,13 @@ def _render(path, record):
           '-crf', '18', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-movflags', '+faststart', str(subtitled)], '字幕版合成')
     shutil.copy2(audio, output_root / '配音.wav')
     (output_root / '动态分镜方案.json').write_text(json.dumps(record['shots'], ensure_ascii=False, indent=2), encoding='utf-8')
-    expected = float(record['scenes'][-1]['end'])
+    expected = narration_duration
     actual = probe_media_duration(raw)
     if abs(actual - expected) > max(1.0, expected * .01):
         raise RuntimeError(f'成片时长校验失败：预期 {expected:.2f} 秒，实际 {actual:.2f} 秒')
+    from .video_bookends import apply_bookends
+    for target in (raw, subtitled):
+        apply_bookends(target, path.parent.name, record.get('creation_parameters') or {})
     return output_root, raw, subtitled
 
 
@@ -388,19 +421,40 @@ def start_export(identity: str, data: ExportRequest, request: Request):
         if record.get('video_waiting_queue') or any(shot.get('video_queued') or shot.get('video_waiting')
                                                    for shot in record.get('shots', [])):
             raise HTTPException(409, '请先完成或取消生成队列，再合成成片')
-        all_static_ready = (bool(record.get('shots')) and
-                            all(shot.get('kind') == 'static' and shot.get('image_status') == 'completed'
-                                for shot in record['shots']))
-        if record['status'] not in {'video_review', 'export_failed', 'completed'} and not (
-                record['status'] == 'video_generation_ready' and all_static_ready):
+        # Switching an unfinished motion shot to static can leave this stage
+        # unchanged even when every remaining motion clip is already complete.
+        # Validate each shot's current kind/assets instead of requiring an
+        # all-static project to escape the generation-ready stage.
+        if record['status'] not in {'video_generation_ready', 'video_review', 'export_failed', 'completed'}:
             raise HTTPException(409, '请先完成全部动态镜头')
         if not record.get('shots'):
             raise HTTPException(409, '项目没有可合成的镜头')
+        if issue := _vibe_export_issue(record):
+            raise HTTPException(409, issue)
         missing = [shot['id'] for shot in record['shots'] if shot['kind']=='video' and shot.get('video_status')!='completed']
         if missing:
             raise HTTPException(409, f'仍有 {len(missing)} 个动态镜头未完成')
+        for index, shot in enumerate(record['shots'], 1):
+            if shot.get('design_needs_review'):
+                raise HTTPException(409, f'第 {index:02d} 镜的设计修改尚未确认，请先核对')
+            if shot.get('kind') == 'static' and shot.get('image_status') != 'completed':
+                raise HTTPException(409, f'第 {index:02d} 镜的静态画面尚未完成')
+            try:
+                _source(path, shot)
+            except ValueError as exc:
+                raise HTTPException(409, f'第 {index:02d} 镜的素材不可用：{exc}') from exc
         if str(path) in studio.ACTIVE:
             raise HTTPException(409, '此任务正在处理')
+        from .video_bookends import resolve_clips
+        parameters = dict(record.get('creation_parameters') or {})
+        for key in ('intro_video_id', 'outro_video_id'):
+            if getattr(data, key) is not None:
+                parameters[key] = getattr(data, key)
+        try:
+            resolve_clips(user_id, parameters)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, '片头片尾素材不可用，请重新上传') from exc
+        record['creation_parameters'] = parameters
         studio.ACTIVE.add(str(path))
         if data.subtitle_layouts is not None:
             record.setdefault('creation_parameters', {})['subtitle_layouts'] = data.subtitle_layouts

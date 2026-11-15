@@ -248,8 +248,14 @@ def recover_interrupted(path, record):
     for shot in record.get('shots', []):
         if shot.get('kind') != 'video' or shot.get('video_status') != 'running':
             continue
-        if shot.get('video_backend') == 'cloud_h3':
-            shot.update(video_status='unknown', video_error='集群任务身份已保留，请继续查询。', video_resume_available=True, video_terminal=False)
+        from .cloud_video import is_cloud_shot, interrupted_values
+        if is_cloud_shot(record, shot):
+            shot.update(interrupted_values(shot))
+            if shot['video_not_submitted']:
+                shot['video_error'] = shot['video_progress_message']
+            else:
+                shot.update(video_error='集群任务身份已保留，请继续查询。',
+                            video_progress_message='本地处理已中断，尚未重新核对云端状态；请继续查询原任务')
             continue
         if shot.get('video_backend') == 'comfyui':
             shot.update(video_status='failed', video_error='上次本地 ComfyUI 生成被 OCV 关闭中断，可重新生成本镜。',
@@ -279,6 +285,11 @@ def recover_missing_clips(path, record):
         try:
             file = _asset(path, str(shot.get('video') or ''))
             if file.is_file() and file.stat().st_size:
+                continue
+            if studio.has_vibe_output(shot):
+                shot.update(video_status='failed', video_error='正式动效文件缺失，请重新采用或撤回本镜动效；不会提交付费任务。',
+                            video_resume_available=False, video_terminal=True)
+                changed = True
                 continue
             if shot.get('video_backend') == 'comfyui':
                 shot.update(video_status='failed', video_error='本地 ComfyUI 视频文件缺失，可重新生成本镜。',
@@ -313,7 +324,9 @@ def _inputs(path, record, shot):
     core = studio._storyboard_image_path(path, shot)
     if not core.is_file() or path.resolve() not in core.resolve().parents:
         raise ValueError('本镜核心分镜图不存在，请恢复或重新生成核心图')
-    prompt = str(shot.get('video_prompt') or '')
+    from .video_reference_numbers import normalize_video_references
+    prompt = normalize_video_references(shot.get('video_prompt'), shot, record.get('references', []))
+    shot['video_prompt'] = prompt
     numbers = [int(value) for value in re.findall(r'(?:图\s*|<Picture\s*)(\d+)', prompt, re.I)]
     highest = max(numbers, default=1)
     if highest > 9 or highest < 1:
@@ -329,13 +342,13 @@ def _inputs(path, record, shot):
         selected = [Path(value) for value in studio._shot_reference_paths(
             path, record, {**shot, 'reference_ids': ids[:highest - 1]})]
     except ValueError as exc:
-        raise ValueError(f'视频提示词引用了额外图片（最高图{highest}），对应素材缺失；请恢复素材或将视频提示词改为仅使用图1核心图') from exc
+        raise ValueError(f"镜头 {shot['id']}：视频提示词引用了额外图片（最高图{highest}），对应素材缺失；请恢复对应素材") from exc
     return (core, *selected)
 
 
-def _freeze_shot_audio(path: Path, shot: dict, destination: Path) -> None:
+def _freeze_shot_audio(path: Path, shot: dict, destination: Path, *, audio_source: Path | None = None) -> None:
     """Cut the confirmed TTS interval into the immutable local request."""
-    source = path / 'assets' / 'audio.wav'
+    source = audio_source if audio_source is not None else path / 'assets' / 'audio.wav'
     if not source.is_file():
         raise ValueError('当前动态项目缺少完整配音，无法传入本镜参考音频')
     start = float(shot.get('start') or 0)
@@ -498,7 +511,7 @@ def _freeze_local_request(path, record, shot, profile_id, *, prompt=None, prompt
         if include_reference_audio:
             snapshot['reference_audio_lipsync'] = bool(shot.get('reference_audio_lipsync', True))
             audio_relative = f'{relative}/references/voice.wav'
-            _freeze_shot_audio(path, shot, _asset(path, audio_relative))
+            _freeze_shot_audio(path, shot, _asset(path, audio_relative), audio_source=_asset(path, record.get('audio') or 'assets/audio.wav'))
             snapshot['reference_audio_file'] = audio_relative
         (target / 'request.json').write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding='utf-8')
     except Exception:
@@ -574,6 +587,7 @@ def _start_local_worker(path, record, identities, user_id, profile_id, use_h3_ag
                         break
                     continue
                 status, error = 'completed', ''
+                preparation_failed = False
                 # Prompt conversion and request freezing happen inside the worker.
                 # Therefore a slow/failed language call cannot block the HTTP
                 # response and never starts a GPU job with a partial prompt.
@@ -647,7 +661,29 @@ def _start_local_worker(path, record, identities, user_id, profile_id, use_h3_ag
                     with studio.LOCK:
                         source_record = studio.read(path)
                         source_shot = copy.deepcopy(studio._find_shot(source_record, identity))
-                    from .presenter_mode import audio_policy, spoken_text
+                    from .presenter_mode import audio_policy, spoken_text, presenter_requested
+                    if not resume_prompt_id and presenter_requested(source_record.get('creation_parameters', {}), source_shot, source_record.get('references', [])):
+                        from .presenter_refresh import inspect_speaker, prepare_presenter
+                        core_path = studio._storyboard_image_path(path, source_shot)
+                        prior = source_shot.get('presenter_override') or {}
+                        if prior.get('image_fingerprint') != hashlib.sha256(core_path.read_bytes()).hexdigest():
+                            with studio.project_language_scope(user_id, studio.planning_parameters(source_record)):
+                                inspection = inspect_speaker(core_path, prior.get('speaker', ''))
+                            source_shot = prepare_presenter(source_shot, inspection)
+                            with studio.LOCK:
+                                latest = studio.read(path)
+                                target = studio._find_shot(latest, identity)
+                                for field in ('action', 'video_prompt', 'presenter_override', 'presenter_plan_status', 'visual_design'):
+                                    target[field] = source_shot[field]
+                                target.pop('motion_plan', None)
+                                latest['logs'].append(f'{identity}：已依据最终核心图定稿讲解员对口型方案；使用本镜最终配音。')
+                                latest['revision'] += 1
+                                studio.save(path, latest)
+                        elif source_shot.get('presenter_plan_status') == 'audio_changed':
+                            with studio.LOCK:
+                                latest = studio.read(path)
+                                studio._find_shot(latest, identity)['presenter_plan_status'] = 'ready'
+                                studio.save(path, latest)
                     shot_reference_audio, shot_lipsync = audio_policy(
                         source_record.get('creation_parameters', {}), source_shot, use_h3_agent, source_record.get('references', []))
                     effective_source_prompt = enforce_no_auto_subtitles(source_shot.get('video_prompt'))
@@ -655,7 +691,7 @@ def _start_local_worker(path, record, identities, user_id, profile_id, use_h3_ag
                         effective_source_prompt = _prompt_with_reference_audio(effective_source_prompt, lipsync=shot_lipsync)
                         if shot_lipsync:
                             effective_source_prompt += '\n【仅用于发音，不可上屏的台词】\n' + spoken_text(source_shot)
-                        audio_source = path / 'assets' / 'audio.wav'
+                        audio_source = _asset(path, source_record.get('audio') or 'assets/audio.wav')
                         if not audio_source.is_file():
                             raise ValueError('当前项目缺少完整配音，无法启用讲解员参考音频')
                         source_shot['reference_audio_digest'] = hashlib.sha256(audio_source.read_bytes()).hexdigest()
@@ -674,7 +710,7 @@ def _start_local_worker(path, record, identities, user_id, profile_id, use_h3_ag
                         shot = studio._find_shot(current, identity)
                         if resume_prompt_id:
                             shot.update(video_status='running', video_error='', video_execution_started=True,
-                                        video_task_id=resume_prompt_id)
+                                        video_not_submitted=False, video_task_id=resume_prompt_id)
                             snapshot = copy.deepcopy(shot)
                             current['logs'].append(f'{identity}：开始续查原本地任务，不创建新的生成尝试。')
                             current['revision'] += 1
@@ -699,7 +735,8 @@ def _start_local_worker(path, record, identities, user_id, profile_id, use_h3_ag
                                 resolution=resolution if resolution in {*VIDEO_RESOLUTION_PRESETS, 'custom'} else '',
                                 dimensions=dimensions,
                             )
-                            shot.update(video_status='running', video_error='', video_execution_started=True)
+                            shot.update(video_status='running', video_error='', video_execution_started=True,
+                                        video_not_submitted=False)
                             current['logs'].append(f'{identity}：开始调用本地 ComfyUI，使用预设“{profile.get("name") or profile_id}”，实际分辨率 {dimensions[0]} × {dimensions[1]}，本地任务串行执行。')
                             current['revision'] += 1
                             studio.save(path, current)
@@ -707,6 +744,7 @@ def _start_local_worker(path, record, identities, user_id, profile_id, use_h3_ag
                 except ComfyUIStopped as exc:
                     status, error = 'stopped', str(exc)
                 except Exception as exc:
+                    preparation_failed = True
                     status, error = 'failed', f'H3 提示词转换或本地请求准备失败：{str(exc)[:1600]}' if use_h3_agent else str(exc)[:1800]
 
                 def progress(message):
@@ -751,6 +789,15 @@ def _start_local_worker(path, record, identities, user_id, profile_id, use_h3_ag
                     live.update(video_status=status, video_error=error,
                                 video_resume_available=False, video_terminal=True)
                     live.update(video_finished_at=time.time(), video_progress_message='已完成，可试看' if status == 'completed' else error)
+                    # A failed H3 conversion without a frozen request has never
+                    # reached ComfyUI. Keep it eligible for the ordinary Start
+                    # / generate-unfinished action, not only terminal retries.
+                    # Never discard or reclassify an existing task identity.
+                    if (use_h3_agent and preparation_failed and not live.get('video_request')
+                            and not live.get('video_task_id') and not live.get('video_state_file')):
+                        live.update(video_status='pending', video_terminal=False,
+                                    video_not_submitted=True, video_execution_started=False,
+                                    video_progress_message=error + '；尚未提交视频任务，可重新点击生成。')
                     if status == 'completed':
                         live['video_design_changed'] = False
                         live['video_version'] = _video_version(_asset(path, live['video']))
@@ -1052,7 +1099,7 @@ def _generate_for_user(identity, data, user_id):
             raise HTTPException(400, '静态镜头不需要生成视频')
         if data.regenerate_completed and not data.shot_ids:
             raise HTTPException(400, '重新生成必须明确选择镜头')
-        selected = [shot for shot in record['shots'] if shot['kind'] == 'video'
+        selected = [shot for shot in record['shots'] if shot['kind'] == 'video' and not studio.has_vibe_output(shot)
                     and (not data.shot_ids or shot['id'] in data.shot_ids)
                     and (data.regenerate_completed or shot.get('video_status') != 'completed')]
         if not selected:
@@ -1158,7 +1205,7 @@ def _generate_for_user(identity, data, user_id):
                     needs_audio, _ = audio_policy(record.get('creation_parameters', {}), shot, options['h3_prompt_agent'], record.get('references', []))
                     if needs_audio and not (binding.get('node_id') and binding.get('input_name')):
                         raise ValueError(f'{shot["id"]} 的工作流没有映射参考音频节点')
-                    if needs_audio and not (path / 'assets' / 'audio.wav').is_file():
+                    if needs_audio and not _asset(path, record.get('audio') or 'assets/audio.wav').is_file():
                         raise ValueError('当前项目缺少完整配音，无法启用讲解员参考音频')
                 elif not previous or data.regenerate_completed or shot.get('video_terminal'):
                     from .presenter_mode import presenter_requested
@@ -1365,6 +1412,10 @@ def adopt_historical_video(identity: str, shot_id: str, index: int,
         if shot.get('kind') != 'video':
             raise HTTPException(409, '静态镜头没有历史视频版本')
         entry, output = _history_video(path, shot, index)
+        if (entry.get('video_request') or {}).get('backend') == 'vibe':
+            # Never use the legacy history switch to bypass Vibe's live-source
+            # check or accidentally attach a previous adoption's undo target.
+            raise HTTPException(409, '这是历史 Vibe 动效；请在本镜动效面板重新预览并采用，以核对最新配音字幕')
         _archive_current_video(path, shot, '切换历史版本前保留的当前片段')
         history = list(shot.get('video_history') or [])
         # The current version may have just been appended, so remove by the

@@ -4,6 +4,21 @@
 
 const API_BASE = ''
 
+async function explainTransportError(status, message) {
+  if (status < 500 || message.trim()) return message
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 2000)
+  try {
+    const health = await fetch('/api/health', { signal: controller.signal, credentials: 'include' })
+    if (health.ok) return message
+  } catch {
+    // A failed local health check is not a cloud authentication error.
+  } finally {
+    clearTimeout(timeout)
+  }
+  return '本地后端未就绪，暂时无法完成操作。请检查 Launcher 启动日志；这不代表账号或密码错误。'
+}
+
 function readableError(value, fallback = '') {
   if (typeof value === 'string') return value.trim() || fallback
   if (Array.isArray(value)) {
@@ -46,6 +61,7 @@ export async function requestJSON(url, options = {}) {
     } catch {
       message = raw
     }
+    message = await explainTransportError(response.status, message)
     const error = new Error(readableError(message, `Request failed with ${response.status}`))
     error.status = response.status
     if (typeof window !== 'undefined' && (
@@ -243,14 +259,24 @@ export const api = {
   }),
   ttsEditor: (id) => requestJSON(`/api/jobs/${id}/tts-editor`),
   ttsEditorStatus: (id) => requestJSON(`/api/jobs/${id}/tts-editor/status`),
+  previewTtsStructure: (id, payload) => requestJSON(`/api/jobs/${id}/tts-editor/structure/preview`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  }),
+  editTtsStructure: (id, payload) => requestJSON(`/api/jobs/${id}/tts-editor/structure`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  }),
   regenerateTtsSegments: (id, indices, settings = {}, textOverrides = {}, subtitleTextOverrides = {}) => requestJSON(`/api/jobs/${id}/tts-editor/regenerate`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ indices, tts_text_overrides: textOverrides, subtitle_text_overrides: subtitleTextOverrides, ...settings }),
   }),
   saveTtsPause: (id, leftIndex, seconds) => requestJSON(`/api/jobs/${id}/tts-editor/pause`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ left_index: leftIndex, seconds }),
   }),
-  rebuildTtsAudio: (id, pauses) => requestJSON(`/api/jobs/${id}/tts-editor/rebuild-audio`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pauses }),
+  rebuildTtsAudio: (id, pauses, subtitleTextOverrides = {}, expectedRevision = null, subtitleOnlyOverrides = {}) => requestJSON(`/api/jobs/${id}/tts-editor/rebuild-audio`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pauses, subtitle_text_overrides: subtitleTextOverrides, expected_revision: expectedRevision, subtitle_only_overrides: subtitleOnlyOverrides }),
+  }),
+  saveTtsSubtitleOnly: (id, updates, expectedRevision = null) => requestJSON(`/api/jobs/${id}/tts-editor/subtitle-only`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ updates, expected_revision: expectedRevision }),
   }),
   undoTtsEdit: (id) => requestJSON(`/api/jobs/${id}/tts-editor/undo`, { method: 'POST' }),
   countTtsTokens: (id, texts) => requestJSON(`/api/jobs/${id}/tts-editor/token-count`, {
@@ -258,6 +284,9 @@ export const api = {
   }),
   resegmentTts: (id, payload) => requestJSON(`/api/jobs/${id}/tts-editor/resegment`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  }),
+  suggestTtsBoundaries: (id, texts) => requestJSON(`/api/jobs/${id}/tts-editor/suggest-boundaries`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ texts }),
   }),
   renderVisualEditor: (id, payload) => requestJSON(`/api/jobs/${id}/visual-editor/render`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(typeof payload === 'string' ? { mode: payload } : payload),

@@ -20,6 +20,8 @@ def main(argv=None):
     sub = parser.add_subparsers(dest='command', required=True)
     for name in ('info', 'guide', 'schema', 'projects', 'drafts', 'audio-tasks'):
         sub.add_parser(name)
+    sub.add_parser('ai-guide').add_argument('--topic', default='start',
+        choices=('start', 'capabilities', 'protocol', 'workflows', 'audio', 'references', 'recovery', 'bridge', 'all'))
     for name in ('draft-save', 'upload'):
         sub.add_parser(name).add_argument('file')
     for name in ('draft-get', 'pack', 'scene-assets', 'generation-settings-get'):
@@ -46,8 +48,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     base = args.base_url.rstrip('/')
     parsed = urllib.parse.urlsplit(base)
-    if parsed.scheme not in ('http', 'https') or parsed.username or parsed.password or parsed.query or parsed.fragment:
-        parser.error('base-url must be an HTTP(S) origin without credentials/query')
+    if (parsed.scheme not in ('http', 'https') or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or parsed.path not in ('', '/')):
+        parser.error('base-url must be an HTTP(S) origin without credentials/path/query')
+    if parsed.hostname not in ('127.0.0.1', 'localhost', '::1'):
+        # Same rule as the MCP: only talk to the OCV on this computer, so a cookie file is never sent elsewhere.
+        parser.error('base-url must point to the OCV on this computer (127.0.0.1, localhost or ::1)')
     jar = http.cookiejar.MozillaCookieJar(args.cookie_file) if args.cookie_file else http.cookiejar.CookieJar()
     if args.cookie_file:
         jar.load(ignore_discard=True)
@@ -70,6 +76,8 @@ def main(argv=None):
         info = call(prefix + '/info')  # Authenticate/check plugin before uploads too.
         if args.command == 'info':
             result = info
+        elif args.command == 'ai-guide':
+            result = call(prefix + '/ai-guide?' + urllib.parse.urlencode({'topic': args.topic}))
         elif args.command in ('guide', 'schema', 'projects', 'drafts', 'audio-tasks'):
             result = call(prefix + '/' + args.command)
         elif args.command in ('upload', 'image-upload'):

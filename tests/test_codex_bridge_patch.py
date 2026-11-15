@@ -86,6 +86,79 @@ class PatchTests(unittest.TestCase):
         self.assertTrue(result['impacts'][0]['video_needs_review'])
         self.assertEqual((self.path/'record.json').read_bytes(), raw)
 
+    def test_pending_design_can_be_repaired_but_is_not_implicitly_confirmed(self):
+        r = self.load()
+        r['shots'][0].update(design_needs_review=True, design_review_confirmed=False)
+        bridge.studio.save(self.path, r)
+        raw = (self.path / 'record.json').read_bytes()
+        preview = self.run_patch(False).json()
+        self.assertTrue(preview['ok'], preview)
+        self.assertEqual(preview['design_review_required'], ['shot01'])
+        self.assertEqual((self.path / 'record.json').read_bytes(), raw)
+        result = self.run_patch().json()
+        self.assertTrue(result['written'], result)
+        self.assertFalse(result['generation_started'])
+        self.assertEqual(result['design_review_required'], ['shot01'])
+        after = self.load()
+        self.assertTrue(after['shots'][0]['design_needs_review'])
+        self.assertFalse(after['shots'][0]['design_review_confirmed'])
+        self.assertEqual(after['shots'][1], r['shots'][1])
+        self.assertEqual(after['audio'], r['audio'])
+        self.assertEqual(after['scenes'], r['scenes'])
+        with self.assertRaisesRegex(ValueError, '字幕范围已调整'):
+            bridge.audit_storyboard([after['shots'][0]], set())
+
+    def test_pending_design_does_not_bypass_actual_design_validation(self):
+        r = self.load()
+        r['shots'][0].update(design_needs_review=True, intent='')
+        bridge.studio.save(self.path, r)
+        raw = (self.path / 'record.json').read_bytes()
+        result = self.run_patch().json()
+        self.assertFalse(result['ok'], result)
+        self.assertIn('缺少本镜头表达目的', str(result['errors']))
+        self.assertEqual((self.path / 'record.json').read_bytes(), raw)
+
+    def test_split_patch_and_confirm_with_uploaded_reference_end_to_end(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        app = FastAPI()
+        app.include_router(bridge.studio.router)
+        client = TestClient(app)
+        base = f'/api/video-studio/{self.id}'
+        r = self.load()
+        r['shots'] = r['shots'][:1]
+        r.update(status='image_review', redraw_references=[
+            {'id': 'img_uploaded', 'file': 'assets/other.jpg'}])
+        r['shots'][0]['reference_ids'] = ['img_uploaded']
+        motion = copy.deepcopy(r['shots'][0]['motion_plan'])
+        bridge.studio.save(self.path, r)
+        with patch.object(bridge.studio, 'require_user', return_value=self.user):
+            split = client.post(base + '/structure', json={
+                'revision': r['revision'], 'action': 'split', 'index': 0, 'boundary': 1})
+            self.assertEqual(split.status_code, 200, split.text)
+            split_record = self.load()
+            ids = [s['id'] for s in split_record['shots']]
+            self.repair.update(revision=split_record['revision'],
+                timeline_token=bridge.timeline_token(split_record, self.path),
+                shots=[{'id': sid, 'intent': f'第{index+1}段新设计',
+                        'image_prompt': '图1为主体参考，主体处于初始状态，清晰全景',
+                        'motion_plan': motion} for index, sid in enumerate(ids)])
+            result = self.run_patch().json()
+            self.assertTrue(result['written'], result)
+            self.assertEqual(result['design_review_required'], ids)
+            self.assertFalse(result['generation_started'])
+            for sid in ids:
+                current = self.load()
+                response = client.post(base + '/design/confirm', json={
+                    'revision': current['revision'], 'shot_id': sid})
+                self.assertEqual(response.status_code, 200, response.text)
+            final = self.load()
+            self.assertTrue(all(s['design_review_confirmed'] for s in final['shots']))
+            self.assertFalse(any(s['design_needs_review'] for s in final['shots']))
+            self.assertEqual(final['audio'], r['audio'])
+            self.assertEqual(final['scenes'], r['scenes'])
+            self.assertTrue(all(s['reference_ids'] == ['img_uploaded'] for s in final['shots']))
+
     def test_patch_preserves_timeline_other_shots_assets_settings(self):
         result = self.run_patch().json()
         self.assertTrue(result['written'], result)
@@ -112,6 +185,27 @@ class PatchTests(unittest.TestCase):
         for key in self.before:
             if key != 'updated_at':
                 self.assertEqual(backup[key], self.before[key], key)
+
+    def test_patch_before_any_core_image_keeps_storyboard_stage(self):
+        r = self.load()
+        for shot in r['shots']:
+            for key in ('image', 'image_status', 'video', 'video_status', 'video_version'):
+                shot.pop(key, None)
+        r['status'] = 'storyboard_review'
+        r.pop('export', None)
+        bridge.studio.save(self.path, r)
+        self.repair.update(revision=r['revision'], timeline_token=bridge.timeline_token(r, self.path))
+        result = self.run_patch().json()
+        self.assertTrue(result['written'], result)
+        self.assertEqual(self.load()['status'], 'storyboard_review')
+
+    def test_missing_global_image_key_is_readable_not_internal_error(self):
+        import module4_video_render as visual
+        r = self.load()
+        r['creation_parameters'] = {'use_cloud_image_pool': False}
+        with patch.object(visual, '_provider_configs', side_effect=RuntimeError('missing key')):
+            with self.assertRaisesRegex(ValueError, '还没有选择出图渠道'):
+                bridge.studio._image_configs(r, 1)
 
     def test_video_only_does_not_invalidate_image(self):
         self.repair['shots'] = [{'id': 'shot01', 'video_prompt': '图1为主体参考，主体逐步变化，固定机位。'}]

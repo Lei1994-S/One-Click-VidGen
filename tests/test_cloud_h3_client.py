@@ -8,12 +8,40 @@ from backend.app import cloud_video as c
 from backend.app.cloud_client import CloudApiError
 
 CAPS={'enabled':True,'workflow_revision':'h3-fast-linux-v1','model':'minimax-h3','resolutions':[{'width':640,'height':384},{'width':384,'height':640}], 'duration_seconds':{'min':2,'max':10}}
-CAPS_2K={**CAPS,'resolutions':CAPS['resolutions']+[
+CAPS_SAFE={**CAPS,'resolutions':CAPS['resolutions']+[
     {'width':1280,'height':720},{'width':720,'height':1280},
-    {'width':2048,'height':1152},{'width':1152,'height':2048}],
-    'default_resolutions':{'landscape':{'width':2048,'height':1152},'portrait':{'width':1152,'height':2048}}}
+    {'width':1664,'height':936},{'width':936,'height':1664}],
+    'default_resolutions':{'landscape':{'width':1664,'height':936},'portrait':{'width':936,'height':1664}}}
 
 class CloudVideoTests(unittest.TestCase):
+    def test_new_server_rates_do_not_require_client_update(self):
+        spec=dict(prompt='tree',reference_image_asset_id='asset',width=640,height=384,duration_seconds=12,seed=3)
+        rates=dict(version='arbitrary-new-version',first_10_seconds_rate='0.08',additional_seconds_rate='0.12',threshold_seconds=10,currency='CNY',duration_basis='requested',rounding='ceil_cent')
+        saved={}
+        c.accept_quote(saved,dict(quote_id='q',credits='1.04',pricing=rates,spec=spec,test_mode=False),spec)
+        self.assertEqual(saved['credits'],'1.04')
+    def test_expired_free_quote_cannot_silently_become_paid(self):
+        client=Mock()
+        client.create_video_job.side_effect=CloudApiError('Quote expired; request a new quote',status_code=409)
+        client.video_job.side_effect=CloudApiError('missing',status_code=404)
+        spec=dict(prompt='tree',reference_image_asset_id='asset',width=640,height=384,duration_seconds=12,seed=3)
+        client.video_quote.return_value=dict(quote_id='paid',credits='0.88',test_mode=False,spec=spec,pricing={'version':'server-config-v2','first_10_seconds_rate':'0.07','additional_seconds_rate':'0.09','threshold_seconds':10,'currency':'CNY','duration_basis':'requested','rounding':'ceil_cent'})
+        with self.assertRaisesRegex(ValueError,'费用发生变化'):
+            c.create_or_renew(client,{'quote_id':'free','client_job_id':'stable','spec':spec},Mock())
+        self.assertEqual(client.create_video_job.call_count,1)
+    def test_tiered_quote_accepted_and_unexpected_increase_rejected(self):
+        for seconds, amount in [(10,'0.70'),(12,'0.88'),(14,'1.06')]:
+            spec=dict(prompt='tree',reference_image_asset_id='asset',width=640,height=384,duration_seconds=seconds,seed=3)
+            quote=dict(quote_id='paid',credits=amount,test_mode=False,spec=spec,pricing={'version':'server-config-v2','first_10_seconds_rate':'0.07','additional_seconds_rate':'0.09','threshold_seconds':10,'currency':'CNY','duration_basis':'requested','rounding':'ceil_cent'})
+            saved={};c.accept_quote(saved,quote,spec)
+            self.assertEqual(saved['credits'],amount)
+            quote['credits']='2'
+            with self.assertRaises(ValueError): c.accept_quote({},quote,spec)
+    def test_client_hardware_limit_is_14_even_when_server_advertises_15(self):
+        caps = {**CAPS, 'duration_seconds': {'min': 2, 'max': 15}}
+        c.validate_duration({'id':'shot-a','duration':14,'generation_duration':14},caps)
+        with self.assertRaisesRegex(ValueError,'shot-a.*14'):
+            c.validate_duration({'id':'shot-a','duration':14.001,'generation_duration':15},caps)
     def test_expired_quote_renews_only_after_verified_miss_same_identity(self):
         client=Mock()
         client.create_video_job.side_effect=[CloudApiError('Quote expired; request a new quote',status_code=409),{'job_id':'new'}]
@@ -44,28 +72,33 @@ class CloudVideoTests(unittest.TestCase):
         client.video_job.assert_not_called();client.video_quote.assert_not_called()
 
     def test_capabilities_respect_orientation_and_no_downgrade(self):
+        unsafe = {**CAPS, 'resolutions': [{'width': 1664, 'height': 937}]}
+        with self.assertRaisesRegex(ValueError, '尺寸上限'):
+            c.dimensions_for(unsafe, {'resolution': 'custom', 'width': 1664, 'height': 937}, '16:9')
+        with self.assertRaises(ValueError):
+            c.dimensions_for(unsafe, {}, '16:9')
         self.assertEqual(c.dimensions_for(CAPS,{},'9:16')[1],(384,640))
         with self.assertRaises(ValueError):c.dimensions_for(CAPS,{'resolution':'720p'},'16:9')
         with self.assertRaises(ValueError):c.dimensions_for({**CAPS,'enabled':False},{},'16:9')
 
     def test_explicit_defaults_and_legacy_capabilities_select_largest_size(self):
-        for ratio,expected in [('16:9',(2048,1152)),('9:16',(1152,2048))]:
+        for ratio,expected in [('16:9',(1664,936)),('9:16',(936,1664))]:
             with self.subTest(ratio=ratio):
-                self.assertEqual(c.dimensions_for(CAPS_2K,{},ratio)[1],expected)
-                legacy={key:value for key,value in CAPS_2K.items() if key!='default_resolutions'}
+                self.assertEqual(c.dimensions_for(CAPS_SAFE,{},ratio)[1],expected)
+                legacy={key:value for key,value in CAPS_SAFE.items() if key!='default_resolutions'}
                 self.assertEqual(c.dimensions_for(legacy,{},ratio)[1],expected)
         # An explicit server default wins even when larger sizes are available.
-        caps={**CAPS_2K,'default_resolutions':{'landscape':{'width':1280,'height':720}}}
+        caps={**CAPS_SAFE,'default_resolutions':{'landscape':{'width':1280,'height':720}}}
         self.assertEqual(c.dimensions_for(caps,{},'16:9')[1],(1280,720))
         with self.assertRaisesRegex(ValueError,'默认尺寸'):
             c.dimensions_for(caps,{},'9:16')
 
     def test_explicit_saved_size_survives_new_default_and_unsupported_size_rejected(self):
-        self.assertEqual(c.dimensions_for(CAPS_2K,{'resolution':'custom','width':640,'height':384},'16:9')[1],(640,384))
-        self.assertEqual(c.dimensions_for(CAPS_2K,{'resolution':'720p'},'9:16')[1],(720,1280))
-        for caps,options in [(CAPS,{'resolution':'custom','width':2048,'height':1152}),
-                             (CAPS_2K,{'resolution':'1080p'}),
-                             ({**CAPS,'default_resolutions':CAPS_2K['default_resolutions']},{})]:
+        self.assertEqual(c.dimensions_for(CAPS_SAFE,{'resolution':'custom','width':640,'height':384},'16:9')[1],(640,384))
+        self.assertEqual(c.dimensions_for(CAPS_SAFE,{'resolution':'720p'},'9:16')[1],(720,1280))
+        for caps,options in [(CAPS,{'resolution':'custom','width':1664,'height':936}),
+                             (CAPS_SAFE,{'resolution':'1080p'}),
+                             ({**CAPS,'default_resolutions':CAPS_SAFE['default_resolutions']},{})]:
             with self.subTest(options=options),self.assertRaises(ValueError):
                 c.dimensions_for(caps,options,'16:9')
 
@@ -78,7 +111,27 @@ class CloudVideoTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             c.validate_duration({'duration':8,'generation_duration':8},{'duration_seconds':{'min':2,'max':6}})
         with self.assertRaises(ValueError):
-            c.validate_duration({'duration':12,'generation_duration':12},{'duration_seconds':{'min':2,'max':30}})
+            c.validate_duration({'duration':14.1,'generation_duration':15},{'duration_seconds':{'min':2,'max':30}})
+        c.validate_duration({'duration':14,'generation_duration':14},{'duration_seconds':{'min':2,'max':30}})
+
+    def test_duration_dependent_size_limits_include_each_side_and_portrait(self):
+        from backend.app.h3_limits import validate_dimensions
+        for width, height, seconds in [(1664,936,14),(936,1664,14),(1532,832,14),(832,1532,14),(1280,720,14)]:
+            validate_dimensions(width,height,seconds)
+        for width, height, seconds in [(1664,936,15),(936,1664,15),(1536,832,15),(1532,833,15),
+                                       (1665,936,14),(1664,937,14),(1280,720,14.01),(1280,720,15),(2000,500,14),(1000,1000,14),(1280,720,16),
+                                       (0,720,14),(1280,720,float('nan'))]:
+            with self.subTest(width=width,height=height,seconds=seconds),self.assertRaises(ValueError):
+                validate_dimensions(width,height,seconds)
+
+    def test_duration_aware_default_and_explicit_oversized_selection(self):
+        caps={**CAPS_SAFE,'resolutions':CAPS_SAFE['resolutions']+[
+            {'width':1532,'height':832},{'width':832,'height':1532}]}
+        self.assertEqual(c.dimensions_for(caps,{},'16:9',14)[1],(1664,936))
+        self.assertEqual(c.dimensions_for(caps,{},'9:16',14)[1],(936,1664))
+        self.assertEqual(c.dimensions_for(caps,{},'16:9',14)[1],(1664,936))
+        with self.assertRaisesRegex(ValueError,'最长 14 秒'):
+            c.dimensions_for(caps,{'resolution':'custom','width':1664,'height':936},'16:9',15)
 
     def test_unknown_task_keeps_frozen_identity_and_dimensions_when_defaults_change(self):
         from backend.app import video_generation as vg
@@ -89,7 +142,7 @@ class CloudVideoTests(unittest.TestCase):
                 'settings':{'ratio':'16:9'},'creation_parameters':{'video_generation_backend':'cloud_h3'},
                 'shots':[{'id':'s1','kind':'video','duration':12,'generation_duration':12,'video_prompt':'tree',
                           'image':'core.jpg','image_status':'completed','video_status':'unknown','video_terminal':False,'video_request':copy.deepcopy(frozen)}]}
-        client=self.client();client.video_capabilities.return_value=CAPS_2K
+        client=self.client();client.video_capabilities.return_value=CAPS_SAFE
         try:
             with patch.object(c,'cloud_client_for',return_value=client),patch.object(c.studio,'directory',return_value=path),patch.object(c.studio,'read',return_value=record),patch.object(c.studio,'save'),patch.object(vg,'_inputs'),patch.object(c.threading,'Thread') as thread:
                 c.generate_cloud('project',vg.GenerateClips(revision=1,shot_ids=['s1']),1)
@@ -110,7 +163,7 @@ class CloudVideoTests(unittest.TestCase):
                 'shots':[{'id':'s1','kind':'video','duration':12,'generation_duration':10,'video_prompt':'tree',
                           'image':'core.jpg','image_status':'completed','video_status':'pending'}]}
         before=copy.deepcopy(record)
-        client=self.client();client.video_capabilities.return_value=CAPS_2K
+        client=self.client();client.video_capabilities.return_value=CAPS_SAFE
         with patch.object(c,'cloud_client_for',return_value=client),patch.object(c.studio,'directory',return_value=path),patch.object(c.studio,'read',return_value=record),patch.object(c.studio,'save') as save,patch.object(vg,'_inputs'),patch.object(c.threading,'Thread') as thread:
             with self.assertRaises(HTTPException) as error:
                 c.generate_cloud('project',vg.GenerateClips(revision=1,shot_ids=['s1']),1)
@@ -120,18 +173,41 @@ class CloudVideoTests(unittest.TestCase):
             thread.assert_not_called();save.assert_not_called()
             client.video_asset.assert_not_called();client.video_quote.assert_not_called();client.create_video_job.assert_not_called()
 
-    def run_worker(self, client, event=None, before=None):
+    def run_worker(self, client, event=None, before=None, probe=None):
         from backend.app import video_generation as vg
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         path=Path(temp.name)
-        shot={'id':'s1','kind':'video','video_backend':'cloud_h3','video_status':'unknown','video_terminal':False,'video_task_id':'','video':'assets/videos/clip.mp4','video_request':{'backend':'cloud_h3','client_job_id':'stable-client','quote_id':'quote-original','width':640,'height':384}}
+        shot={'id':'s1','kind':'video','video_backend':'cloud_h3','video_status':'unknown','video_terminal':False,'video_task_id':'','video':'assets/videos/clip.mp4','video_request':{'backend':'cloud_h3','client_job_id':'stable-client','quote_id':'quote-original','width':640,'height':384,'duration':2}}
         if before:before(shot)
         record={'revision':1,'shots':[shot],'logs':[]}
         def read(_):return copy.deepcopy(record)
         def save(_,value):record.clear();record.update(copy.deepcopy(value))
-        with patch.object(c,'cloud_client_for',return_value=client),patch.object(c.studio,'read',side_effect=read),patch.object(c.studio,'save',side_effect=save),patch.object(c.time,'sleep'),patch('backend.app.pipeline.probe_media_duration',return_value=2):
+        with patch.object(c,'cloud_client_for',return_value=client),patch.object(c.studio,'read',side_effect=read),patch.object(c.studio,'save',side_effect=save),patch.object(c.time,'sleep'),patch('backend.app.pipeline.probe_media_duration',side_effect=probe or (lambda _:2)):
             c._worker(path,1,['s1'],{'s1':({},CAPS,(640,384))},event or threading.Event())
         return record
+
+    def test_15_second_oversized_clip_fails_before_queue_or_upload(self):
+        from backend.app import video_generation as vg
+        from fastapi import HTTPException
+        temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
+        path=Path(temp.name)
+        record={'id':'project','revision':1,'status':'video_review','logs':[],
+                'settings':{'ratio':'16:9'},'creation_parameters':{'video_generation_backend':'cloud_h3'},
+                'shots':[{'id':'s1','kind':'video','duration':14.1,'generation_duration':15,'video_prompt':'tree',
+                          'image':'core.jpg','image_status':'completed','video_status':'pending',
+                          'video_generation_options':{'backend':'cloud_h3','resolution':'custom','width':1664,'height':936}}]}
+        before=copy.deepcopy(record)
+        client=self.client();client.video_capabilities.return_value={**CAPS_SAFE,'duration_seconds':{'min':2,'max':15}}
+        with patch.object(c,'cloud_client_for',return_value=client),patch.object(c.studio,'directory',return_value=path),patch.object(c.studio,'read',return_value=record),patch.object(c.studio,'save') as save,patch.object(vg,'_inputs'),patch.object(c.threading,'Thread') as thread:
+            with self.assertRaises(HTTPException) as error:
+                c.generate_cloud('project',vg.GenerateClips(revision=1,shot_ids=['s1']),1)
+            self.assertEqual(error.exception.status_code,409)
+            self.assertIn('镜头 s1',error.exception.detail)
+            self.assertIn('当前允许 2–14 秒',error.exception.detail)
+            self.assertIn('自动拆分',error.exception.detail)
+            self.assertEqual(record,before)
+            thread.assert_not_called();save.assert_not_called()
+            client.video_asset.assert_not_called();client.video_quote.assert_not_called();client.create_video_job.assert_not_called()
 
     def client(self):
         client=Mock();client.config.max_wait_seconds=10
@@ -150,6 +226,48 @@ class CloudVideoTests(unittest.TestCase):
         self.assertEqual(record['shots'][0]['video_request']['client_job_id'],'stable-client')
         self.assertFalse(record['shots'][0]['video_terminal'])
         self.assertTrue(record['shots'][0]['video_resume_available'])
+        self.assertIn('请继续查询原任务',record['shots'][0]['video_progress_message'])
+
+    def test_restart_clears_stale_running_progress_without_submitting(self):
+        from backend.app import video_generation as vg
+        shot={'id':'s1','kind':'video','video_backend':'cloud_h3','video_status':'running',
+              'video_task_id':'old-job','video_progress_message':'running'}
+        record={'revision':1,'shots':[shot],'logs':[]}
+        vg.recover_interrupted(Path('.'),record)
+        self.assertEqual(shot['video_status'],'unknown')
+        self.assertIn('尚未重新核对云端状态',shot['video_progress_message'])
+        self.assertEqual(shot['video_task_id'],'old-job')
+        self.assertTrue(shot['video_resume_available'])
+
+    def test_resume_old_failed_job_exposes_failure_without_generation_or_download(self):
+        client=self.client()
+        client.video_job.return_value={'job_id':'old-job','status':'failed',
+            'error':{'code':'EXECUTION_OUTCOME_UNKNOWN','message':'节点重启，执行结果无法确认'}}
+        record=self.run_worker(client,before=lambda shot:shot.update(video_task_id='old-job',video_progress_message='running'))
+        shot=record['shots'][0]
+        self.assertEqual(shot['video_status'],'failed')
+        self.assertEqual(shot['video_error'],'EXECUTION_OUTCOME_UNKNOWN：节点重启，执行结果无法确认')
+        self.assertTrue(shot['video_terminal']);self.assertFalse(shot['video_resume_available'])
+        client.video_job.assert_called_once_with('old-job')
+        client.create_video_job.assert_not_called();client.download_to.assert_not_called()
+
+    def test_invalid_download_is_removed_and_original_task_can_be_queried_again(self):
+        for result in [0,float('nan'),RuntimeError('FFprobe 无法读取媒体时长')]:
+            with self.subTest(result=result):
+                client=self.client();client.video_job.return_value={'job_id':'old-job','status':'succeeded'}
+                downloaded=[]
+                def download(url,target,**kwargs):
+                    target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(b'invalid-video');downloaded.append(target)
+                def probe(target):
+                    if isinstance(result,Exception):raise result
+                    return result
+                client.download_to.side_effect=download
+                record=self.run_worker(client,probe=probe)
+                self.assertFalse(downloaded[0].exists())
+                self.assertEqual(record['shots'][0]['video_status'],'unknown')
+                self.assertEqual(record['shots'][0]['video_task_id'],'old-job')
+                self.assertTrue(record['shots'][0]['video_resume_available'])
+                client.create_video_job.assert_not_called()
 
     def test_missing_lookup_resubmits_same_quote_and_same_key(self):
         client=self.client();client.video_job.side_effect=CloudApiError('missing',status_code=404)
@@ -157,6 +275,22 @@ class CloudVideoTests(unittest.TestCase):
         self.run_worker(client)
         client.create_video_job.assert_called_once_with('quote-original','stable-client')
         client.video_quote.assert_not_called()
+
+    def test_missing_old_oversized_job_cannot_submit_again_with_saved_quote(self):
+        client=self.client();client.video_job.side_effect=CloudApiError('missing',status_code=404)
+        record=self.run_worker(client,before=lambda shot:shot['video_request'].update(width=1664,height=936,duration=15))
+        client.video_asset.assert_not_called();client.video_quote.assert_not_called();client.create_video_job.assert_not_called()
+        self.assertIn('最长 14 秒',record['shots'][0]['video_error'])
+        self.assertEqual(record['shots'][0]['video_request']['client_job_id'],'stable-client')
+        self.assertTrue(record['shots'][0]['video_terminal'])
+        self.assertFalse(record['shots'][0]['video_resume_available'])
+
+    def test_existing_old_oversized_job_can_still_be_queried(self):
+        client=self.client();client.video_job.return_value={'job_id':'existing','status':'failed'}
+        record=self.run_worker(client,before=lambda shot:shot['video_request'].update(width=1664,height=936,duration=15))
+        client.video_job.assert_called_once_with('stable-client',by_client=True)
+        client.create_video_job.assert_not_called()
+        self.assertTrue(record['shots'][0]['video_terminal'])
 
     def test_cancel_waits_for_server_terminal(self):
         client=self.client();event=threading.Event()
@@ -192,7 +326,7 @@ class CloudVideoTests(unittest.TestCase):
             'settings':{'ratio':'16:9'}, 'creation_parameters':{'video_generation_backend':'cloud_h3','language_route':'cloud','use_cloud_image_pool':False,'comfyui_h3_prompt_agent':True},
             'shots':[{'id':'s1','kind':'video','duration':1.2,'generation_duration':4,'video_prompt':'green tree',
                 'image':'core.jpg','image_status':'completed','video_status':'pending'}]}
-        client=self.client();client.video_capabilities.return_value=CAPS_2K
+        client=self.client();client.video_capabilities.return_value=CAPS_SAFE
         client.video_job.side_effect=CloudApiError('missing',status_code=404)
         client.video_asset.return_value={'asset_id':'asset-fixture'}
         def quote(spec):return {'quote_id':'quote-frozen','credits':'0','test_mode':True,'spec':dict(spec,num_frames=107)}
@@ -219,7 +353,7 @@ class CloudVideoTests(unittest.TestCase):
         self.assertEqual(record['shots'][0]['video_status'],'completed')
         converter.assert_called_once()
         self.assertEqual(client.video_quote.call_args.args[0]['duration_seconds'],4)
-        self.assertEqual((client.video_quote.call_args.args[0]['width'],client.video_quote.call_args.args[0]['height']),(2048,1152))
+        self.assertEqual((client.video_quote.call_args.args[0]['width'],client.video_quote.call_args.args[0]['height']),(1664,936))
         self.assertEqual(record['shots'][0]['duration'],1.2)
         self.assertEqual(client.create_video_job.call_count,1)
 
@@ -231,6 +365,6 @@ class CloudVideoTests(unittest.TestCase):
             saved=shot['video_request'];saved.pop('quote_id');saved.update(reference_files=['core.jpg'],prompt='test',duration=2,seed=7)
         record=self.run_worker(client,before=before)
         client.create_video_job.assert_not_called()
-        self.assertIn('不再免费',record['error'])
+        self.assertIn('报价不符合',record['error'])
 
 if __name__=='__main__':unittest.main()

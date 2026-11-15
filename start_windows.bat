@@ -1,4 +1,5 @@
 @echo off
+"%SystemRoot%\System32\chcp.com" 65001 >nul 2>nul
 setlocal EnableDelayedExpansion
 
 set "ROOT_DIR=%~dp0"
@@ -25,7 +26,8 @@ set "NUMBA_CACHE_DIR=%ROOT_DIR%runtime\cache\numba"
 set "MPLCONFIGDIR=%ROOT_DIR%runtime\cache\matplotlib"
 set "CUDA_CACHE_PATH=%ROOT_DIR%runtime\cache\cuda"
 set "npm_config_cache=%ROOT_DIR%runtime\npm-cache"
-set "PATH=%ROOT_DIR%runtime\python;%ROOT_DIR%runtime\python\Scripts;%ROOT_DIR%runtime\python\Lib\site-packages\torch\lib;%ROOT_DIR%tools\ffmpeg\bin;%ROOT_DIR%runtime\node;%PATH%"
+rem Repair only this process environment, never the user's global PATH.
+set "PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\WindowsPowerShell\v1.0;%ROOT_DIR%runtime\python;%ROOT_DIR%runtime\python\Scripts;%ROOT_DIR%runtime\python\Lib\site-packages\torch\lib;%ROOT_DIR%tools\ffmpeg\bin;%ROOT_DIR%runtime\node;%PATH%"
 set "HYPERFRAMES_BROWSER_PATH="
 for /r "%ROOT_DIR%runtime\hyperframes\.cache\hyperframes\chrome" %%F in (chrome-headless-shell.exe) do if not defined HYPERFRAMES_BROWSER_PATH set "HYPERFRAMES_BROWSER_PATH=%%F"
 
@@ -67,9 +69,27 @@ if not defined HYPERFRAMES_BROWSER_PATH (
     exit /b 1
 )
 
-where ffmpeg >nul 2>nul
+rem Prefer the bundled executable; do not confuse a missing WHERE with missing FFmpeg.
+set "FFMPEG_EXE=%ROOT_DIR%tools\ffmpeg\bin\ffmpeg.exe"
+if not exist "!FFMPEG_EXE!" (
+    set "FFMPEG_EXE="
+    if not exist "%SystemRoot%\System32\where.exe" (
+        echo [ERROR] Bundled FFmpeg is missing and Windows where.exe is unavailable.
+        echo Expected: %ROOT_DIR%tools\ffmpeg\bin\ffmpeg.exe
+        pause
+        exit /b 1
+    )
+    for /f "delims=" %%F in ('%SystemRoot%\System32\where.exe ffmpeg.exe 2^>nul') do if not defined FFMPEG_EXE set "FFMPEG_EXE=%%F"
+)
+if not defined FFMPEG_EXE (
+    echo [ERROR] FFmpeg was not found in the portable package or PATH.
+    echo Expected: %ROOT_DIR%tools\ffmpeg\bin\ffmpeg.exe
+    pause
+    exit /b 1
+)
+"!FFMPEG_EXE!" -version >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] FFmpeg was not found.
+    echo [ERROR] FFmpeg exists but could not run: !FFMPEG_EXE!
     pause
     exit /b 1
 )
@@ -101,8 +121,16 @@ if not exist "frontend\node_modules" (
 
 if not exist "%ROOT_DIR%runtime_logs" mkdir "%ROOT_DIR%runtime_logs"
 
+if not exist "%ROOT_DIR%tools\launcher_service_probe.py" (
+    echo [ERROR] Launcher probe is missing. Reinstall the complete launcher patch.
+    goto :startup_failed
+)
 call :check_backend_state
 set "BACKEND_STATE=%errorlevel%"
+if not "%BACKEND_STATE%"=="0" if not "%BACKEND_STATE%"=="1" if not "%BACKEND_STATE%"=="2" if not "%BACKEND_STATE%"=="3" (
+    echo [ERROR] Backend probe failed with code %BACKEND_STATE%. Backend state is unknown; startup cancelled.
+    goto :startup_failed
+)
 if "%BACKEND_STATE%"=="2" (
     echo [RESTART] Backend source files changed; stopping stale service on port 8010...
     call :stop_port 8010
@@ -177,13 +205,11 @@ pause
 exit /b 1
 
 :check_url
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "try { $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri '%~1'; if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) { exit 0 } } catch {}; exit 1" >nul 2>nul
+"%BACKEND_PYTHON%" "%ROOT_DIR%tools\launcher_service_probe.py" url "%~1"
 exit /b %errorlevel%
 
 :check_backend_state
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "try { $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri 'http://127.0.0.1:8010/api/health'; $data = $response.Content | ConvertFrom-Json; if (-not $data.server_started_at) { exit 2 }; $started = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$data.server_started_at * 1000)).UtcDateTime; $files = @(); $files += Get-ChildItem -LiteralPath '%ROOT_DIR%backend\app' -Recurse -File -Filter '*.py'; $files += Get-ChildItem -LiteralPath '%ROOT_DIR%' -File -Filter '*.py'; $latest = $files | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1; if ($latest -and $latest.LastWriteTimeUtc -gt $started.AddSeconds(2)) { if ($null -eq $data.active_task_count -or [int]$data.active_task_count -gt 0) { exit 3 }; exit 2 }; exit 0 } catch { exit 1 }" >nul 2>nul
+"%BACKEND_PYTHON%" "%ROOT_DIR%tools\launcher_service_probe.py" backend "%ROOT_PATH%"
 exit /b %errorlevel%
 
 :stop_port
@@ -199,11 +225,10 @@ if "!STOP_FAILED!"=="1" (
 exit /b 0
 
 :wait_port_closed
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$deadline = [DateTime]::UtcNow.AddSeconds(10); while ([DateTime]::UtcNow -lt $deadline) { $listening = netstat -ano | Select-String -Pattern ('^\s*TCP\s+\S+:' + %~1 + '\s+\S+\s+LISTENING\s+\d+\s*$'); if (-not $listening) { exit 0 }; Start-Sleep -Milliseconds 250 }; exit 1" >nul 2>nul
+"%BACKEND_PYTHON%" "%ROOT_DIR%tools\launcher_service_probe.py" closed "%~1"
 exit /b %errorlevel%
 
 :wait_url
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$deadline = [DateTime]::UtcNow.AddSeconds(45); while ([DateTime]::UtcNow -lt $deadline) { try { $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri '%~1'; if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) { Write-Host '[OK] %~2 ready: %~1'; exit 0 } } catch {}; Start-Sleep -Milliseconds 500 }; Write-Host '[ERROR] %~2 did not become ready: %~1'; exit 1"
+"%BACKEND_PYTHON%" "%ROOT_DIR%tools\launcher_service_probe.py" wait "%~1"
 exit /b %errorlevel%
+

@@ -25,6 +25,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from .auth import COOKIE_NAME, current_user_from_request, local_auth_enabled, local_user, require_user, sign_session
 from .config import _parse_env_lines, save_project_env_values
+from .local_access import WorkspaceMediaFiles, local_request_boundary
 from .cloud_client import CloudApiError, cloud_client_for, load_cloud_config, tts_queue_accepting
 from .cloud_tts import build_quote_payload
 from .diagnostics import create_diagnostic_package
@@ -151,6 +152,8 @@ class BgmTrackRequest(BaseModel):
 
 
 class GenerateRequest(BaseModel):
+    intro_video_id: str = Field(default='', max_length=180)
+    outro_video_id: str = Field(default='', max_length=180)
     @field_validator("tts_voice_id", mode="before")
     @classmethod
     def migrate_null_local_voice(cls, value):
@@ -197,11 +200,13 @@ class GenerateRequest(BaseModel):
     visual_style: str = "video-edit-agent"
     visual_backend: str | None = "poster"
     use_cloud_image_pool: bool = False
+    language_route: Literal['project', 'cloud', 'personal'] = 'project'
     method: Literal["running", "ican"] = "running"
     size: ImageSize = "2560x1440"
     image_profile_id: str | None = Field(default=None, max_length=80)
     image_resolution: Literal["1k", "2k", "4k"] | None = '2k'
     video_render_variant: Literal["subtitles", "raw", "both"] = "both"
+    image_transition: Literal['none','layered','brush','dissolve','black','white','left','right','up','down'] = 'none'
     video_orientation: Literal['landscape', 'portrait'] = 'landscape'
     subtitle_layouts: dict[str, Any] = Field(default_factory=dict)
     bgm_enabled: bool = False
@@ -222,7 +227,8 @@ class GenerateRequest(BaseModel):
     presenter_reference_id: str = Field(default='', max_length=200)
     visual_prompt_mode: Literal["simple", "full"] = "simple"
     visual_pacing_preset: Literal["auto", "slow", "standard", "fast", "custom"] = "standard"
-    dynamic_max_shot_duration: Literal[10, 15, 30] = 15
+    dynamic_max_shot_duration: int = Field(default=14, ge=4, strict=True)
+    dynamic_cluster_duration_recommended: bool = True
     visual_min_duration: float | None = Field(default=None, ge=4, le=20)
     visual_target_duration: float | None = Field(default=None, ge=5, le=30)
     visual_max_duration: float | None = Field(default=None, ge=6, le=40)
@@ -293,6 +299,9 @@ class SubtitleRenderRequest(BaseModel):
 
 
 class VisualRenderRequest(BaseModel):
+    intro_video_id: str | None = Field(default=None, max_length=180)
+    outro_video_id: str | None = Field(default=None, max_length=180)
+    image_transition: Literal['none','layered','brush','dissolve','black','white','left','right','up','down'] = 'none'
     mode: Literal["subtitles", "raw", "both"] = "both"
     video_orientation: Literal['landscape', 'portrait'] | None = None
     subtitle_layouts: dict[str, Any] | None = None
@@ -382,10 +391,28 @@ class TtsBoundaryPauseRequest(BaseModel):
 
 class TtsRebuildAudioRequest(BaseModel):
     pauses: dict[int, float] = Field(default_factory=dict)
+    subtitle_text_overrides: dict[int, str] = Field(default_factory=dict)
+    subtitle_only_overrides: dict[int, str] = Field(default_factory=dict)
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+class TtsSubtitleOnlyRequest(BaseModel):
+    updates: dict[int, str]
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+class TtsStructureRequest(BaseModel):
+    action: Literal['insert', 'delete']
+    expected_revision: int = Field(ge=0)
+    indices: list[int] = Field(default_factory=list, max_length=200)
+    anchor_index: int | None = Field(default=None, ge=1)
+    position: Literal['before', 'after'] = 'after'
+    text: str = Field(default='', max_length=1200)
+    pause_after: float = Field(default=0, ge=0, le=30)
 
 
 class TtsTokenCountRequest(BaseModel):
-    texts: list[str] = Field(min_length=1, max_length=2)
+    texts: list[str] = Field(min_length=1, max_length=24)
 
 
 class TtsResegmentPart(BaseModel):
@@ -395,9 +422,10 @@ class TtsResegmentPart(BaseModel):
 
 
 class TtsResegmentRequest(BaseModel):
+    sync_text: bool = False
     start_index: int = Field(ge=1)
     replace_count: Literal[1, 2]
-    parts: list[TtsResegmentPart] = Field(min_length=1, max_length=2)
+    parts: list[TtsResegmentPart] = Field(min_length=1, max_length=24)
     tts_voice_id: str | None = Field(default=None, max_length=180)
     tts_speed: float | None = Field(default=None, ge=0.5, le=2)
     tts_volume: float | None = Field(default=None, ge=0.1, le=10)
@@ -461,6 +489,8 @@ class ApiKeySettingsRequest(BaseModel):
     language_api_base_url: str | None = Field(default=None, max_length=2048)
     language_api_key: str | None = Field(default=None, max_length=2048)
     custom_llm_thinking_mode: Literal["follow", "disabled", "enabled"] | None = None
+    custom_llm_reasoning_compat: bool | None = None
+    custom_llm_reply_timeout: int | None = Field(default=None, ge=10, le=600)
     image_api_base_url: str | None = Field(default=None, max_length=2048)
     image_model: str | None = Field(default=None, max_length=256)
     image_resolution: str | None = Field(default=None, max_length=64)
@@ -485,6 +515,8 @@ class EditRequest(BaseModel):
 
 
 app = FastAPI(title="Voice Over Video API")
+from .announcements import router as announcements_router
+app.include_router(announcements_router)
 from .image_studio import router as image_studio_router
 app.include_router(image_studio_router)
 from .comfyui_bridge import router as comfyui_bridge_router
@@ -501,6 +533,24 @@ from .video_export import reconcile_completed_projects, router as video_export_r
 app.include_router(video_model_config_router)
 app.include_router(video_generation_router)
 app.include_router(video_export_router)
+from .storyboard_preview import router as storyboard_preview_router
+app.include_router(storyboard_preview_router)
+from .image_layer_packs import router as image_layer_pack_router
+app.include_router(image_layer_pack_router)
+from .vibe_preview import router as vibe_preview_router
+app.include_router(vibe_preview_router)
+from .vibe_routing import router as vibe_routing_router
+from .vibe_design import router as vibe_design_router
+from .vibe_adoption import router as vibe_adoption_router
+app.include_router(vibe_routing_router)
+app.include_router(vibe_design_router)
+app.include_router(vibe_adoption_router)
+from .vibe_config import router as vibe_config_router
+from .vibe_cloud import router as vibe_cloud_router
+from .vibe_shotcraft_gallery import router as vibe_shotcraft_gallery_router
+app.include_router(vibe_config_router)
+app.include_router(vibe_cloud_router)
+app.include_router(vibe_shotcraft_gallery_router)
 from .image_profiles import router as image_profiles_router
 app.include_router(image_profiles_router)
 from .subtitle_preview import router as subtitle_preview_router
@@ -519,11 +569,12 @@ app.add_middleware(
 )
 
 WORKSPACE_DIR = PROJECT_ROOT / "workspace"
+app.middleware("http")(local_request_boundary)
 PARAMETER_PRESETS_DIR = PROJECT_ROOT / "saved_parameters"
 AGENT_PROMPT_PRESETS_DIR = PROJECT_ROOT / "saved_agent_prompts"
 PLUGINS_DIR = PROJECT_ROOT / "plugins"
 if WORKSPACE_DIR.exists():
-    app.mount("/workspace", StaticFiles(directory=str(WORKSPACE_DIR)), name="workspace")
+    app.mount("/workspace", WorkspaceMediaFiles(directory=str(WORKSPACE_DIR)), name="workspace")
 
 
 @app.on_event("startup")
@@ -634,12 +685,14 @@ def _plugin_manifest_items() -> list[dict[str, Any]]:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
+    from .release_version import release_info
     indextts25 = load_indextts25_config()
     local_tts_component = local_tts_component_status()
     cloud = load_cloud_config()
     active_tasks = store.active_job_summary() + edit_store.active_job_summary()
     return {
         "ok": True,
+        "release": release_info(),
         # Stable aliases used by older launchers/frontends now describe 2.5.
         "tts_online": indextts25.ready,
         "tts_provider": "official IndexTTS-2.5 (local GPU)",
@@ -696,7 +749,7 @@ def list_plugins(request: Request) -> dict[str, Any]:
         "directory": str(PLUGINS_DIR.resolve()),
         "framework_only": not any(p['valid'] and not p['framework_only'] for p in plugins),
         "execution_enabled": False,
-        "notice": "支持可选导演配置与 Codex 制作桥；仅使用宿主提供的受控接口，不执行任意第三方代码。",
+        "notice": "支持可选导演配置与 AI 制作桥；仅使用宿主提供的受控接口，不执行任意第三方代码。",
     }
 
 
@@ -1258,7 +1311,7 @@ def _api_key_status() -> dict[str, Any]:
             "source": config.get("source", "relay"),
             "configured": provider_configured,
             "count": 1 if provider_key and provider_configured else 0,
-            "key_hints": _masked_api_keys([provider_key]) if not config.get("disabled") else [],
+            "key_hints": _masked_api_keys([provider_key]),
             "selected_model": "" if name == "custom" and provider_configured else provider_model,
             "models": language_provider_models(name),
             "allow_custom_model": bool(config.get("allow_custom_model")),
@@ -1323,6 +1376,8 @@ def _api_key_status() -> dict[str, Any]:
                 "" if selected_configured else selected_base_url
             ) if legacy_relay_selected or provider == "custom" else "",
             "custom_thinking_mode": str(values.get("CUSTOM_LLM_THINKING_MODE") or "follow"),
+            "custom_reasoning_compat": values.get("CUSTOM_LLM_REASONING_COMPAT", "1") == "1",
+            "custom_reply_timeout": int(values.get("CUSTOM_LLM_REPLY_TIMEOUT") or "120"),
             "providers": provider_statuses,
         },
         "image": {
@@ -1355,15 +1410,18 @@ def _required_job_config_error(data: dict[str, Any]) -> str | None:
     # instead of blocking the audio stage up front.
     if bool(data.get("step_mode")):
         return None
-    if not main_workflow or bool(data.get("use_cloud_image_pool")):
+    if not main_workflow:
+        return None
+    from .language_routing import uses_cloud_language
+    if data.get("use_cloud_image_pool") and uses_cloud_language(data):
         return None
     status = _api_key_status()
-    if not status["language"]["configured"]:
-        return "完整视频生成需要语言模型 API Key，请先在接口配置中保存后再启动"
+    if not uses_cloud_language(data) and not status["language"]["configured"]:
+        return "本项目当前使用个人语言模型 API，但尚未配置密钥。请在“本项目生成渠道”切换为云端语言模型号池，或在“接口与服务”配置个人 API；全局号池开关不会自动修改已有项目。"
     visual_backend = str(data.get("visual_backend") or "poster").lower()
     has_selected_profile = bool(data.get("image_profile_snapshot"))
-    if visual_backend in {"poster", "online-poster", "runninghub"} and not (status["image"]["configured"] or has_selected_profile):
-        return "在线海报生成需要第三方图像 API Key，请先在接口配置中保存后再启动"
+    if not data.get("use_cloud_image_pool") and visual_backend in {"poster", "online-poster", "runninghub"} and not (status["image"]["configured"] or has_selected_profile):
+        return "本项目当前使用个人图像 API，但尚未配置可用接口。请在“本项目生成渠道”切换为云端图像号池，或在“接口与服务”配置个人图像 API。"
     return None
 
 
@@ -1641,9 +1699,11 @@ def preflight_job(payload: GenerateRequest, request: Request) -> dict[str, Any]:
         language_required = True
         image_required = str(data.get("visual_backend") or "poster").lower() in {"poster", "online-poster", "runninghub"}
         use_cloud_pool = bool(data.get("use_cloud_image_pool"))
+        from .language_routing import uses_cloud_language
+        cloud_language = uses_cloud_language(data)
         with ThreadPoolExecutor(max_workers=2) as executor:
             language_future = (
-                None if use_cloud_pool
+                None if cloud_language
                 else executor.submit(_probe_language_api, values) if language_required else None
             )
             image_keys = _runninghub_api_keys(values)
@@ -1658,26 +1718,26 @@ def preflight_job(payload: GenerateRequest, request: Request) -> dict[str, Any]:
             if image_future:
                 status, message = image_future.result()
                 add("image_api", "图像模型 API", status, message)
-            elif image_required and use_cloud_pool:
+            if cloud_language or (image_required and use_cloud_pool):
                 client = cloud_client_for(int(user["id"]))
                 state = client.session_snapshot()
                 if not state.get("configured"):
-                    add("language_api", "云端文本号池", "error", "尚未配置 CLOUD_API_BASE_URL")
-                    add("image_api", "云端号池", "error", "尚未配置 CLOUD_API_BASE_URL")
+                    if cloud_language: add("language_api", "云端文本号池", "error", "尚未配置 CLOUD_API_BASE_URL")
+                    if use_cloud_pool: add("image_api", "云端号池", "error", "尚未配置 CLOUD_API_BASE_URL")
                 elif not state.get("authenticated"):
-                    add("language_api", "云端文本号池", "error", "请先登录右上角云端账户")
-                    add("image_api", "云端号池", "error", "请先登录右上角云端账户")
+                    if cloud_language: add("language_api", "云端文本号池", "error", "请先登录右上角云端账户")
+                    if use_cloud_pool: add("image_api", "云端号池", "error", "请先登录右上角云端账户")
                 else:
                     try:
                         account = client.account_summary()
-                        client.model_pool_status()
-                        client.image_pool_status(data.get("method", "running"))
+                        if cloud_language: client.model_pool_status()
+                        if use_cloud_pool: client.image_pool_status(data.get("method", "running"))
                         credits = account.get("credits") if isinstance(account.get("credits"), dict) else {}
                         available = float(credits.get("available") or 0)
                         pool_status = "passed" if available > 0 else "error"
                         pool_message = f"云端账户已登录，可用积分 {available:g}" if available > 0 else "云端账户积分不足"
-                        add("language_api", "云端文本号池", pool_status, pool_message)
-                        add(
+                        if cloud_language: add("language_api", "云端文本号池", pool_status, pool_message)
+                        if use_cloud_pool: add(
                             "image_api",
                             "云端号池",
                             pool_status,
@@ -1689,11 +1749,12 @@ def preflight_job(payload: GenerateRequest, request: Request) -> dict[str, Any]:
                             if isinstance(exc, CloudApiError) and exc.status_code == 404
                             else str(exc)
                         )
-                        add("language_api", "云端文本号池", "error", message)
-                        add("image_api", "云端号池", "error", message)
+                        if cloud_language: add("language_api", "云端文本号池", "error", message)
+                        if use_cloud_pool: add("image_api", "云端号池", "error", message)
 
         if data.get('dynamic_video') and data.get('presenter_mode'):
-            valid_presenter = data.get('presenter_reference_id') in (data.get('reference_image_ids') or [])
+            valid_presenter = (data.get('presenter_reference_id') == '__shot__' or
+                               data.get('presenter_reference_id') in (data.get('reference_image_ids') or []))
             add('presenter', '讲解员参考图', 'passed' if valid_presenter else 'error',
                 '已指定讲解员，按镜头规划开口表演' if valid_presenter else '请选择已上传的讲解员参考图')
         if data.get('dynamic_video') and data.get('video_generation_backend') == 'comfyui':
@@ -1718,7 +1779,7 @@ def preflight_job(payload: GenerateRequest, request: Request) -> dict[str, Any]:
                 workflow(capabilities)
                 if data.get('presenter_mode') or data.get('comfyui_reference_audio'):
                     raise ValueError('集群 H3 测试阶段暂不支持参考音频或对口型，请关闭该功能')
-                add('video_backend', '动态镜头生成', 'passed', '集群 H3（测试免费）；配音和核心图确认后提交，容器按需启停')
+                add('video_backend', '动态镜头生成', 'passed', '集群 H3：费率从云端读取，生成前确认；按请求时长收费')
             except (CloudApiError, ValueError) as exc:
                 add('video_backend', '动态镜头生成', 'error', str(exc))
         elif data.get('dynamic_video'):
@@ -1852,6 +1913,8 @@ def save_api_key_settings(payload: ApiKeySettingsRequest, request: Request) -> d
         and not language_provider
         and not language_model
         and custom_llm_thinking_mode is None
+        and payload.custom_llm_reasoning_compat is None
+        and payload.custom_llm_reply_timeout is None
         and not image_api_base_url
         and not image_model
         and not image_resolution
@@ -1912,18 +1975,32 @@ def save_api_key_settings(payload: ApiKeySettingsRequest, request: Request) -> d
     existing_image_base_url = str(
         existing.get("IMAGE_API_BASE_URL") or existing.get("RUNNINGHUB_BASE_URL") or ""
     ).strip()
+    if language_api_base_url and language_provider:
+        config = LANGUAGE_PROVIDER_OPTIONS[language_provider]
+        old_base = str(existing.get(config["base_env"]) or config.get("default_base") or "").rstrip("/")
+        if old_base != language_api_base_url.rstrip("/") and not language and existing.get(config["key_env"]):
+            raise HTTPException(400, "更换语言接口地址时请重新填写 API Key，旧密钥不会发送到新地址")
+    image_destination_changed = bool(image_api_base_url and image_api_base_url.rstrip("/") != existing_image_base_url.rstrip("/"))
+    if image_destination_changed and existing_image:
+        if not supplied_image:
+            raise HTTPException(400, "更换图像接口地址时请重新填写 API Key，旧密钥不会发送到新地址")
+        existing_image = []
     if supplied_image and not (image_api_base_url or existing_image_base_url or existing_image):
         raise HTTPException(status_code=400, detail="请先填写图像 API Base URL")
     image_pool = _unique_api_keys([*existing_image, *supplied_image])
     image_primary = (
         image
-        or existing.get("RUNNINGHUB_API_KEY", "").strip()
+        or (existing.get("RUNNINGHUB_API_KEY", "").strip() if not image_destination_changed else "")
         or (image_pool[0] if image_pool else "")
     )
 
     # Relay model families share GEMINI_API_KEY. Official providers keep their
     # own credentials so an official key is never accidentally sent to a relay.
     updates: dict[str, str] = {}
+    if image_destination_changed:
+        for name in existing:
+            if re.fullmatch(r"RUNNINGHUB_API_KEY_?\d+", name):
+                updates[name] = ""
     if language_provider:
         provider_config = LANGUAGE_PROVIDER_OPTIONS[language_provider]
         if provider_config.get("disabled"):
@@ -1941,6 +2018,10 @@ def save_api_key_settings(payload: ApiKeySettingsRequest, request: Request) -> d
         if language:
             updates[provider_config["key_env"]] = language
         if language_provider == "custom":
+            if payload.custom_llm_reasoning_compat is not None:
+                updates["CUSTOM_LLM_REASONING_COMPAT"] = "1" if payload.custom_llm_reasoning_compat else "0"
+            if payload.custom_llm_reply_timeout is not None:
+                updates["CUSTOM_LLM_REPLY_TIMEOUT"] = str(payload.custom_llm_reply_timeout)
             if custom_llm_thinking_mode is not None:
                 updates["CUSTOM_LLM_THINKING_MODE"] = custom_llm_thinking_mode
             # An old relay installation is displayed as the unified custom
@@ -1969,7 +2050,10 @@ def save_api_key_settings(payload: ApiKeySettingsRequest, request: Request) -> d
                     or ""
                 ).strip()
                 if legacy_key and not str(existing.get("CUSTOM_LLM_API_KEY") or "").strip():
-                    updates["CUSTOM_LLM_API_KEY"] = legacy_key
+                    if not language:
+                        if language_api_base_url and language_api_base_url.rstrip("/") != legacy_base:
+                            raise HTTPException(400, "迁移并更换语言接口地址时请重新填写 API Key")
+                        updates["CUSTOM_LLM_API_KEY"] = legacy_key
                 if legacy_base and not language_api_base_url and not str(existing.get("CUSTOM_LLM_API_BASE") or "").strip():
                     updates["CUSTOM_LLM_API_BASE"] = legacy_base
                 if legacy_model and not language_model and not str(existing.get("CUSTOM_LLM_MODEL") or "").strip():
@@ -2017,9 +2101,14 @@ def save_api_key_settings(payload: ApiKeySettingsRequest, request: Request) -> d
 @app.delete("/api/api-keys/{kind}/{index}")
 def delete_api_key(kind: str, index: int, request: Request, provider: str | None = None) -> dict[str, Any]:
     require_user(request)
-    if kind not in {"language", "image"} or index < 0:
+    if kind not in {"language", "image", "qwen_tts"} or index < 0:
         raise HTTPException(status_code=400, detail="无效的 API Key 类型或序号")
     values = _parse_env_lines(PROJECT_ROOT / ".env")
+    if kind == "qwen_tts":
+        if index != 0 or not str(values.get("DASHSCOPE_API_KEY") or "").strip():
+            raise HTTPException(status_code=404, detail="找不到要删除的 Qwen-TTS API Key")
+        save_project_env_values({"DASHSCOPE_API_KEY": ""})
+        return {"keys": _api_key_status(), "message": "Qwen-TTS 本机密钥已清除；服务商密钥未撤销。"}
     if kind == "language":
         provider_name = str(provider or values.get("LANGUAGE_PROVIDER") or "gemini_official").strip().lower()
         provider_config = LANGUAGE_PROVIDER_OPTIONS.get(provider_name)
@@ -2206,6 +2295,10 @@ def save_parameter_preset(payload: ParameterPresetRequest, request: Request) -> 
     user = require_user(request)
     allowed_fields = set(GenerateRequest.model_fields) - {"api_key"}
     raw = {key: value for key, value in payload.parameters.items() if key in allowed_fields}
+    # Older clients serialize an unset route as null. Keep the schema's
+    # project-inheritance semantics instead of forcing personal/cloud.
+    if raw.get("language_route") is None:
+        raw.pop("language_route", None)
     try:
         parameters = GenerateRequest(**raw).model_dump(exclude={"api_key"})
     except ValueError as exc:
@@ -2385,6 +2478,11 @@ def create_job(payload: GenerateRequest, request: Request) -> dict[str, Any]:
             str(data.get("global_character_prompt") or ""),
         )
     script = str(data.get("script") or "").strip()
+    # Skipping subtitle correction is only meaningful with an uploaded narration (skip_tts).
+    # When OCV generates the narration from the script, always correct against it; a stale
+    # flag copied from another project must not silently keep raw ASR text (all TTS engines).
+    if not data.get("skip_tts") and data.get("skip_text_correction"):
+        data["skip_text_correction"] = False
     if data.get("module1_only"):
         data["skip_tts"] = False
         data["skip_text_correction"] = False
@@ -2472,12 +2570,22 @@ def get_job(job_id: str, request: Request) -> dict[str, Any]:
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-def cancel_job(job_id: str, request: Request) -> dict[str, Any]:
+def cancel_job(job_id: str, request: Request, expected_run_id: str | None = None) -> dict[str, Any]:
     user = require_user(request)
     job = store.get(job_id)
     if not job or job.user_id != int(user["id"]):
         raise HTTPException(status_code=404, detail="job not found")
-    return store.cancel(job)
+    try:
+        if expected_run_id is not None and job.snapshot()['run_id'] != expected_run_id:
+            raise ValueError('任务已重新启动，请刷新后停止对应任务')
+        task = tts_editor.status(job_id)
+        if task.get('status') == 'running' and task.get('task_id'):
+            result = tts_editor.cancel(job_id, task['task_id'])
+            if not result['accepted']:
+                raise ValueError(result.get('reason', '配音编辑正在保存，请稍后停止'))
+        return store.cancel(job, expected_run_id=expected_run_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -2540,16 +2648,17 @@ def advance_step_workflow(
             "dynamic_text_mode", "video_generation_backend", "comfyui_profile_id",
             "comfyui_h3_prompt_agent", "comfyui_reference_audio",
             "content_mode", "director_strategy", "scene_references_enabled", "auto_split_long_text", "split_text_threshold",
-            "visual_backend", "use_cloud_image_pool", "method", "size", "image_profile_id", "image_resolution", "visual_prompt_mode",
+            "visual_backend", "use_cloud_image_pool", "language_route", "method", "size", "image_profile_id", "image_resolution", "visual_prompt_mode",
             "visual_pacing_preset", "visual_min_duration", "visual_target_duration",
-            "visual_max_duration", "visual_max_slides", "visual_style_prompt", "dynamic_max_shot_duration",
+            "visual_max_duration", "visual_max_slides", "visual_style_prompt", "dynamic_max_shot_duration", "dynamic_cluster_duration_recommended",
             "global_character_prompt", "reference_image_ids", "reference_image_notes", "reference_image_labels", "reference_image_kinds", "story_environment_prompt", "presenter_mode", "presenter_reference_id",
             "visual_prompt_system", "agent0_prompt_system", "agent1_prompt_system",
             "agent2_director_theme",
         },
         "confirm_visual": set(),
         "start_render": {
-            "video_orientation", "subtitle_layouts",
+            "intro_video_id", "outro_video_id",
+            "video_orientation", "subtitle_layouts", "image_transition",
             "video_render_variant", "bgm_enabled", "bgm_tracks",
             "bgm_fade_enabled", "bgm_fade_duration",
         },
@@ -2609,7 +2718,8 @@ def advance_step_workflow(
         config_error = _required_job_config_error(visual_request)
         if config_error:
             raise HTTPException(status_code=400, detail=config_error)
-        if bool(job.request.get("use_cloud_image_pool")):
+        from .language_routing import uses_cloud_language
+        if bool(job.request.get("use_cloud_image_pool")) or uses_cloud_language(job.request):
             client = cloud_client_for(int(user["id"]))
             cloud_state = client.session_snapshot()
             if not cloud_state.get("configured"):
@@ -2618,8 +2728,10 @@ def advance_step_workflow(
                 raise HTTPException(status_code=401, detail="使用号池前请先登录右上角云端账户")
             try:
                 account = client.account_summary()
-                client.model_pool_status()
-                client.image_pool_status(job.request.get("method", "running"))
+                if uses_cloud_language(job.request):
+                    client.model_pool_status()
+                if job.request.get("use_cloud_image_pool"):
+                    client.image_pool_status(job.request.get("method", "running"))
                 credits = account.get("credits") if isinstance(account.get("credits"), dict) else {}
                 if float(credits.get("available") or 0) <= 0:
                     raise HTTPException(status_code=402, detail="云端账户积分不足，无法使用文本与图像号池")
@@ -2733,6 +2845,12 @@ def save_step_workflow_subtitles(
         timeline_path, subtitle_path, items = _step_subtitle_payload(job)
     except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    from .subtitle_proofread import preview as proofread_preview, timing_token
+    try:
+        proofread = proofread_preview(items, payload.updates)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    before_timing = timing_token(items)
     valid_ids = {
         str(item.get("slide_id") or item.get("id") or f"scene_{index:03d}")
         for index, item in enumerate(items, start=1)
@@ -2760,7 +2878,30 @@ def save_step_workflow_subtitles(
     persist_step_workflow_state(job, stage, message="字幕文字已保存，等待确认")
     store.update(job, request=job.request, message="字幕文字已保存，等待确认")
     store.log(job, f"分步模式：已保存 {len(payload.updates)} 句字幕修改")
-    return get_step_workflow_subtitles(job_id, request)
+    result = get_step_workflow_subtitles(job_id, request)
+    result['verification'] = {'timing_unchanged': timing_token(items) == before_timing,
+                              'audio_unchanged': True, 'tts_called': False, 'changes': proofread['changes']}
+    return result
+
+
+class SubtitleProofreadRequest(BaseModel):
+    updates: dict[str, str] = Field(default_factory=dict)
+    reference_text: str = Field(default='', max_length=50000)
+    terms: list[str] = Field(default_factory=list, max_length=200)
+
+
+@app.post('/api/jobs/{job_id}/step-workflow/subtitles/preview')
+def preview_step_subtitles(job_id: str, payload: SubtitleProofreadRequest, request: Request):
+    user = require_user(request)
+    job = store.get(job_id)
+    if not job or job.user_id != int(user['id']):
+        raise HTTPException(404, 'job not found')
+    try:
+        _, _, items = _step_subtitle_payload(job)
+        from .subtitle_proofread import preview
+        return preview(items, payload.updates, payload.reference_text or str(job.request.get('script') or ''), payload.terms)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/jobs/{job_id}/retry-tts")
@@ -3487,9 +3628,35 @@ def get_tts_editor(job_id: str, request: Request) -> dict[str, Any]:
 
 @app.get("/api/jobs/{job_id}/tts-editor/status")
 def get_tts_editor_status(job_id: str, request: Request) -> dict[str, Any]:
-    _job, user_id = _owned_completed_job(job_id, request)
-    return {"task": tts_editor.status(job_id), "revision": tts_editor.revision(job_id, user_id),
-            "pending_alignment": tts_editor.pending_alignment(job_id, user_id)}
+    user = require_user(request)
+    job = store.get(job_id)
+    if not job or job.user_id != int(user['id']):
+        raise HTTPException(404, 'job not found')
+    user_id = int(user['id'])
+    revision = tts_editor.revision(job_id, user_id)
+    try:
+        pending = tts_editor.pending_alignment(job_id, user_id)
+    except (OSError, ValueError):
+        pending = None
+    task = tts_editor.status(job_id)
+    return {"task": task, "revision": revision, "adopted_version": revision,
+            "pending_version": task.get('pending_version'), "pending_alignment": pending}
+
+
+class TtsEditCancelRequest(BaseModel):
+    task_id: str
+
+
+@app.post('/api/jobs/{job_id}/tts-editor/cancel')
+def cancel_tts_editor(job_id: str, payload: TtsEditCancelRequest, request: Request):
+    user = require_user(request)
+    job = store.get(job_id)
+    if not job or job.user_id != int(user['id']):
+        raise HTTPException(404, 'job not found')
+    try:
+        return tts_editor.cancel(job_id, payload.task_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 class TtsEstimatedAdoption(BaseModel):
@@ -3596,11 +3763,70 @@ def rebuild_tts_audio(job_id: str, payload: TtsRebuildAudioRequest, request: Req
     if visual_status.get('task', {}).get('status') == 'running' or visual_status.get('has_active_image_tasks'):
         raise HTTPException(status_code=409, detail='请等待当前重绘或重新渲染完成后再合成配音')
     try:
-        return tts_editor.rebuild_audio(job=job, user_id=user_id, pauses=payload.pauses)
+        return tts_editor.rebuild_audio(
+            job=job, user_id=user_id, pauses=payload.pauses,
+            subtitle_text_overrides=payload.subtitle_text_overrides,
+            expected_revision=payload.expected_revision,
+            subtitle_only_overrides=payload.subtitle_only_overrides,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post('/api/jobs/{job_id}/tts-editor/subtitle-only')
+def save_tts_subtitle_only(job_id: str, payload: TtsSubtitleOnlyRequest, request: Request) -> dict[str, Any]:
+    job, user_id = _owned_completed_job(job_id, request)
+    visual_status = visual_editor.status(job_id)
+    if visual_status.get('task', {}).get('status') == 'running' or visual_status.get('has_active_image_tasks'):
+        raise HTTPException(status_code=409, detail='请等待当前重绘或重新渲染完成后再修改字幕')
+    try:
+        return tts_editor.save_subtitle_only(job=job, user_id=user_id, updates=payload.updates,
+                                             expected_revision=payload.expected_revision)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _tts_structure_context(job_id, request):
+    job, user_id = _owned_completed_job(job_id, request)
+    current = visual_editor.status(job_id)
+    if current.get('task', {}).get('status') == 'running' or current.get('has_active_image_tasks'):
+        raise HTTPException(409, '请等待当前重绘或渲染结束后再增删配音')
+    if job.request.get('dynamic_video'):
+        from . import video_studio
+        with video_studio.LOCK:
+            record = video_studio.find_audio_storyboard(user_id, job_id)
+            if record:
+                video_studio.editable(record, record['revision'])
+    return job, user_id
+
+
+@app.post('/api/jobs/{job_id}/tts-editor/structure/preview')
+def preview_tts_structure(job_id: str, payload: TtsStructureRequest, request: Request):
+    job, user_id = _tts_structure_context(job_id, request)
+    from .tts_structure_edit import preview
+    try:
+        return preview(tts_editor, job, user_id, payload.model_dump())
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post('/api/jobs/{job_id}/tts-editor/structure')
+def edit_tts_structure(job_id: str, payload: TtsStructureRequest, request: Request):
+    job, user_id = _tts_structure_context(job_id, request)
+    from .tts_structure_edit import start
+    try:
+        start(tts_editor, job, user_id, payload.model_dump())
+        return {'ok': True, 'message': '配音增删已开始，请等待时间轴同步完成'}
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/jobs/{job_id}/visual-editor/subtitles/hide")
@@ -3690,6 +3916,26 @@ def count_tts_editor_tokens(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/jobs/{job_id}/tts-editor/suggest-boundaries")
+def suggest_tts_boundaries(job_id: str, payload: TtsTokenCountRequest, request: Request):
+    job, user_id = _owned_completed_job(job_id, request)
+    text = "".join(payload.texts)
+    if not text.strip() or len(text) > 2400:
+        raise HTTPException(status_code=400, detail="断句建议仅处理当前交界，最多 2400 字")
+    if tts_editor.status(job_id).get('status') == 'running':
+        raise HTTPException(status_code=409, detail="请等待当前配音编辑完成")
+    from .tts_segmentation import segment_indextts25_text
+    from .language_routing import project_language_scope
+    try:
+        with project_language_scope(user_id, job.request):
+            chunks, source, _ = segment_indextts25_text(text)
+        if ''.join(chunks) != text or len(chunks) > 24:
+            raise ValueError("断句建议无法完整保留当前文字，请手动调整")
+        return {"parts": chunks, "source": source, "message": "仅生成断句建议，尚未保存或重配"}
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/jobs/{job_id}/tts-editor/resegment")
 def resegment_tts_audio(
     job_id: str,
@@ -3707,8 +3953,9 @@ def resegment_tts_audio(
             start_index=payload.start_index,
             replace_count=payload.replace_count,
             parts=[part.model_dump() for part in payload.parts],
+            sync_text=payload.sync_text,
             settings_override=payload.model_dump(
-                exclude={"start_index", "replace_count", "parts"}, exclude_none=True
+                exclude={"start_index", "replace_count", "parts", "sync_text"}, exclude_none=True
             ),
         )
     except RuntimeError as exc:
@@ -3756,7 +4003,7 @@ def render_visual_editor_video(job_id: str, payload: VisualRenderRequest, reques
             "fade_enabled": payload.bgm_fade_enabled,
             "fade_duration": payload.bgm_fade_duration,
         }
-    presentation = {key: value for key, value in {'video_orientation': payload.video_orientation, 'subtitle_layouts': payload.subtitle_layouts}.items() if value is not None}
+    presentation = {key: value for key, value in {'intro_video_id':payload.intro_video_id, 'outro_video_id':payload.outro_video_id, 'video_orientation': payload.video_orientation, 'subtitle_layouts': payload.subtitle_layouts, 'image_transition':payload.image_transition}.items() if value is not None}
     visual_editor.render_video(job=job, mode=payload.mode, bgm_override=bgm_override, presentation=presentation)
     return {"ok": True, "message": "module 5 render started"}
 

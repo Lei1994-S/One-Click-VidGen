@@ -1,0 +1,615 @@
+"""Local-only MCP/application adapter; no imports of live OCV application state."""
+import hashlib
+import http.cookiejar
+import json
+import mimetypes
+import re
+import threading
+import time
+import uuid
+from pathlib import Path
+from urllib.parse import quote, urlsplit
+
+import httpx
+from jsonschema import Draft202012Validator
+
+from .contracts import bind, is_credential_field, check_operation_name, OperationError
+from .state import State
+from .guidance import discovery
+
+UPLOAD_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.wav', '.mp3', '.m4a', '.aac',
+                     '.flac', '.ogg', '.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v',
+                     '.srt', '.ass', '.vtt'}
+MAX_BYTES = 256 * 1024 * 1024
+# The current user is re-checked on every call (owner scoping of plans/results/assets must
+# follow logins immediately). Only the plugin-enabled gate is reused briefly per user, so
+# consecutive tool calls pay one extra round trip instead of two. ocv_connection always re-checks.
+GATE_CACHE_SECONDS = 20
+CONFIRM_FORMAL_EDITS = {'ocv_video_vibe_intent','ocv_video_vibe_adopt','ocv_video_vibe_undo'}
+LOCAL_COMPUTE_COST = {
+    'ocv_video_layer_pack_create': '本机确定性裁切与补底；不上传图片，不调用计费模型',
+    'ocv_video_vibe_preview_create': '使用本机算力渲染单镜预览；不上传素材，不调用计费模型，不替换正式镜头',
+    'ocv_video_vibe_intent': '本地修改生成意图，不渲染、不调用计费模型，也不采用预览',
+    'ocv_video_vibe_adopt': '本地采用已核对的无声片段进入正式时间轴，不重新生成，不调用计费模型',
+    'ocv_video_vibe_undo': '本地恢复采用前的镜头，不重新生成，不调用计费模型',
+    'ocv_video_vibe_cloud_stop': '仅停止指定任务，不发起新生成；已提交远端请求可能仍运行或计费，不保证退款',
+}
+
+
+def operation_cost(op, arguments, schema=None):
+    body = arguments.get('body', {})
+    if op.name == 'ocv_video_vibe_cloud_continue_steps':
+        image_notice='不新增图片请求；本任务后续续接也不能重新开启图片授权'
+        if body.get('confirm_remaining_images') is True:
+            used,limit=body.get('expected_image_requests'),body.get('expected_image_limit')
+            remaining=max(0,limit-used) if type(used) is int and type(limit) is int else '以校验后的原记录为准'
+            image_notice=(f'已单独确认沿用原图片权限：最多使用原剩余 {remaining} 次图片请求，可能计费；'
+                '原权限已关闭、用量已变或渠道不一致则拒绝，不增加图片额度、不切换渠道')
+        return (f'手动从空响应前保存步骤继续调用 Vibe 专用模型，可能计费；明确追加 {body.get("additional_model_calls",0)} 次模型调用，'
+                '原用量保留，原剩余预算仍有效，累计授权不超过50次，失败请求和交付核查均计入。'
+                +image_notice+'；只制作预览，不覆盖正式镜头，不自动重试、不重放旧工具；'
+                '同一request_id不会重复增加预算或重启任务')
+    if op.name == 'ocv_video_vibe_cloud_continue_review':
+        return (f'从已有预览继续调用 Vibe 专用模型检查与返工，可能计费；明确追加 {body.get("additional_model_calls",0)} 次模型调用，'
+                '原有剩余预算仍有效，累计授权不超过50次；失败请求和独立交付审核均计入预算。'
+                '复用现有素材与代码，本机重新校验和渲染，不新增图片请求、不覆盖正式镜头；同一request_id不会重复增加预算或重启任务')
+    if op.name == 'ocv_video_vibe_cloud_create':
+        if body.get('template_mode') == 'layered':
+            budget = body['max_image_requests']
+            policy_supported = 'advanced_subject_separation' in (schema or {}).get('properties', {}).get('body', {}).get('properties', {})
+            return ('本镜核心图、已绑定参考图和最终字幕时间戳将发送到独立 Vibe API，设计及视觉核查可能计费；'
+                    + ('已启用高级主体分离：可在本机使用 RMBG 提取主体，不启动 ComfyUI；'
+                       if body.get('advanced_subject_separation') is True else
+                       '默认稳定保留主体于底板，重建文字与装饰动效；本轮未启用高级主体分离，不调用 RMBG 把主体拆出；' if policy_supported else
+                       '当前服务未提供主体策略开关，沿用旧原图分层行为，可在本机使用 RMBG 提取主体；')
+                    + (f'背景提取沿用“本项目图像模型”的已保存渠道、模型和清晰度，图像请求上限为 {budget}，最多计费生成 1 张背景；'
+                       if budget else '图像请求上限为 0，未授权背景出图；缺少可用背景时停止提示，不擅自加预算；')
+                    + '对照原分镜图检查合成画面，最多一次视觉返工；视频在本机渲染，只预览、不自动采用，不自动切换渠道'
+                    + ('；旧渠道任务可能仍在运行或计费，本计划明确授权用当前项目渠道另建任务，不会取消旧任务'
+                       if body.get('confirm_new_image_task') else ''))
+        return ('本镜核心图、已绑定参考图和最终字幕时间戳将发送到独立 Vibe API，设计及视觉核查可能计费；'
+                '继承原分镜配色与背景风格，最多两轮修正；本轮不自动抠图、不调用图像模型，图像请求上限为 0；'
+                '视频在本机渲染，不自动采用，不自动切换渠道')
+    if op.name == 'ocv_video_vibe_design':
+        if body.get('engine', 'local') == 'local':
+            return '仅本机提取和编排，不外发、不调用计费模型'
+        return '使用本项目语言渠道，可能计费；' + ('发送版式文字和字幕，不发送图片'
+            if body.get('model_input') == 'layout' else '发送缩略图和字幕')
+    return LOCAL_COMPUTE_COST.get(op.name, '未报价；生成前可使用原生 quote/validate 操作核对，不能据此视为免费')
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                     separators=(',', ':')).encode()).hexdigest()
+
+
+def clean(value):
+    if isinstance(value, dict):
+        return {k: ('[REDACTED]' if is_credential_field(k) else clean(v))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [clean(v) for v in value]
+    if isinstance(value, str):
+        value = re.sub(r'(?i)\bBearer\s+[\w.\-]+', 'Bearer [REDACTED]', value)
+        value = re.sub(r'\bsk-[A-Za-z0-9_-]{12,}', '[REDACTED]', value)
+        value = re.sub(r'(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|authorization)\s*[=:]\s*)[^\s,;]+',
+                       r'\1[REDACTED]', value)
+    return value
+
+
+def no_credentials(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if is_credential_field(key):
+                raise ValueError('MCP 不接收密钥或账号凭据，请在 OCV 设置中配置后选择对应渠道')
+            no_credentials(item)
+    elif isinstance(value, list):
+        for item in value:
+            no_credentials(item)
+
+
+class ApiError(Exception):
+    def __init__(self, status, detail):
+        self.status, self.detail = status, clean(detail)
+        super().__init__(f'OCV HTTP {status}: {self.detail}')
+
+
+class HttpSession:
+    def __init__(self, base_url, cookie_file=None):
+        parsed = urlsplit(base_url)
+        if (parsed.scheme not in {'http', 'https'} or parsed.hostname not in {'127.0.0.1', 'localhost', '::1'}
+                or parsed.username or parsed.password or parsed.path not in {'', '/'} or parsed.query or parsed.fragment):
+            raise ValueError('本版只连接本机 OCV origin，不接受远程地址、路径或 URL 凭据')
+        jar = http.cookiejar.MozillaCookieJar(str(cookie_file)) if cookie_file else http.cookiejar.CookieJar()
+        if cookie_file:
+            jar.load(ignore_discard=True, ignore_expires=False)
+        self.base_url = base_url.rstrip('/')
+        self.client = httpx.Client(base_url=self.base_url, cookies=jar, follow_redirects=False,
+                                   trust_env=False, timeout=httpx.Timeout(300, connect=5))
+
+    def close(self):
+        self.client.close()
+
+    def call(self, method, path, **kwargs):
+        if not path.startswith('/api/') and path != '/openapi.json':
+            raise ValueError('禁止访问非 OCV 接口')
+        if path in {'/api/session', '/api/codex-bridge/info', '/openapi.json'}:
+            kwargs['timeout'] = 15
+        with self.client.stream(method, path, **kwargs) as response:
+            data = bytearray()
+            for block in response.iter_bytes():
+                data.extend(block)
+                if len(data) > 16 * 1024 * 1024:
+                    raise ValueError('OCV JSON 响应过大，请读取单镜资料或分页日志')
+            try:
+                payload = json.loads(data)
+            except (UnicodeError, ValueError):
+                payload = {'detail': 'OCV 返回非 JSON 内容'}
+            if not 200 <= response.status_code < 300:
+                raise ApiError(response.status_code, payload.get('detail', payload))
+            return payload
+
+    def download(self, method, path, folder, **kwargs):
+        temporary = folder / (uuid.uuid4().hex + '.part')
+        try:
+            with self.client.stream(method, path, **kwargs) as response:
+                if not 200 <= response.status_code < 300:
+                    response.read()
+                    try:
+                        detail = response.json().get('detail')
+                    except ValueError:
+                        detail = '素材下载失败'
+                    raise ApiError(response.status_code, detail)
+                mime = response.headers.get('content-type', 'application/octet-stream').split(';')[0]
+                # Preview endpoints sometimes return JSON/base64 instead of a file.
+                if mime == 'application/json':
+                    payload = bytearray()
+                    for block in response.iter_bytes():
+                        payload.extend(block)
+                        if len(payload) > 16 * 1024 * 1024:
+                            raise ValueError('预览 JSON 超过 16 MB')
+                    return None, clean(json.loads(payload))
+                extension = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp',
+                              'audio/wav': '.wav', 'audio/x-wav': '.wav', 'audio/mpeg': '.mp3',
+                              'video/mp4': '.mp4', 'text/plain': '.txt',
+                              'application/x-subrip': '.srt' }.get(mime, '.bin')
+                size = 0
+                with temporary.open('xb') as handle:
+                    for block in response.iter_bytes():
+                        size += len(block)
+                        if size > MAX_BYTES:
+                            raise ValueError('文件超过 256 MB 下载上限，请使用 OCV 成果目录')
+                        handle.write(block)
+                final = temporary.with_suffix(extension)
+                temporary.replace(final)
+                return final, mime
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+class Adapter:
+    def __init__(self, base_url, state_dir, *, cookie_file=None, upload_roots=(), upload_files=(),
+                 read_only=False, allow_generation=False, allow_delete=False, transport_factory=None):
+        self.base_url = base_url.rstrip('/')
+        self.transport_factory = transport_factory or (lambda: HttpSession(base_url, cookie_file))
+        self.state = State(state_dir)
+        self.upload_roots = tuple(Path(p).resolve(strict=True) for p in upload_roots)
+        self.upload_files = frozenset(Path(p).resolve(strict=True) for p in upload_files)
+        self.started_at = time.time()
+        if any(not p.is_file() or p.suffix.lower() not in UPLOAD_EXTENSIONS for p in self.upload_files):
+            raise ValueError('单文件上传授权必须指向支持的素材文件')
+        if any(not p.is_dir() for p in self.upload_roots):
+            raise ValueError('上传授权根必须是目录')
+        self.read_only, self.allow_generation, self.allow_delete = read_only, allow_generation, allow_delete
+        self.bound, self.unavailable = {}, []
+        self.schema_lock = threading.Lock()
+        self.slots = threading.BoundedSemaphore(4)
+        self.dispatch_lock = threading.Lock()
+        self.active = set()
+        self.active_lock = threading.Lock()
+        self.auth_cache = None  # (owner, plugin gate checked_at)
+        self.auth_lock = threading.Lock()
+        try:
+            self.state.maybe_prune()
+        except Exception:
+            pass  # Cleanup is best effort and must not block the MCP from starting.
+
+    def authenticate(self, client, refresh=False):
+        session = client.call('GET', '/api/session')
+        user = session.get('user')
+        if not user or user.get('id') is None:
+            raise ValueError('请先登录 OCV；账号模式需提供有效 cookie-file，本地模式自动使用本地用户')
+        owner = digest([self.base_url, user['id'], session.get('auth_mode')])
+        with self.auth_lock:
+            cached = self.auth_cache
+            fresh = (not refresh and cached and cached[0] == owner
+                     and time.monotonic() - cached[1] < GATE_CACHE_SECONDS)
+        if not fresh:
+            client.call('GET', '/api/codex-bridge/info')  # Honor native plugin enable/auth gate.
+            with self.auth_lock:
+                self.auth_cache = (owner, time.monotonic())
+        return owner
+
+    def ensure_catalog(self, client, refresh=False):
+        with self.schema_lock:
+            if not self.bound or refresh:
+                self.bound, self.unavailable = bind(client.call('GET', '/openapi.json'))
+
+    def connect(self, refresh=False):
+        client = self.transport_factory()
+        try:
+            owner = self.authenticate(client, refresh)
+            self.ensure_catalog(client, refresh)
+            return client, owner
+        except Exception as exc:
+            self.forget_auth(exc)
+            client.close()
+            raise
+
+    def forget_auth(self, exc=None):
+        """Drop the cached plugin-gate check, e.g. after plugin disable or logout (401/403/404)."""
+        if exc is None or (isinstance(exc, ApiError) and exc.status in {401, 403, 404}):
+            with self.auth_lock:
+                self.auth_cache = None
+
+    def allowed(self, op):
+        if op.access == 'read':
+            return True
+        return not self.read_only and (op.access != 'generate' or self.allow_generation) and (
+            op.access != 'delete' or self.allow_delete)
+
+    def status(self):
+        client, _ = self.connect(refresh=True)
+        client.close()
+        return {'connected': True, 'base_url': self.base_url, 'operations': len(self.bound), 'ai_guide': discovery(),
+                'read_only': self.read_only, 'generation_enabled': self.allow_generation,
+                'delete_enabled': self.allow_delete, 'unavailable_operations': self.unavailable,
+                'ui_automation': False, 'remote_connections': False,
+                'upload_roots': [str(p) for p in self.upload_roots],
+                'upload_files': [str(p) for p in sorted(self.upload_files)],
+                'upload_policy_loaded_at': self.started_at,
+                'upload_policy_fingerprint': digest([sorted(map(str, self.upload_roots)), sorted(map(str, self.upload_files))]),
+                'upload_policy_reload': '启动配置修改后需重新连接 MCP；此处显示当前连接实际生效范围，不自动扩大授权。'}
+
+    def upload_preflight(self, local_path):
+        try:
+            file = self.upload_file({'local_path': local_path})
+            return {'allowed': True, 'bytes': file.stat().st_size, 'upload_started': False}
+        except (OSError, ValueError) as exc:
+            return {'allowed': False, 'reason': clean(str(exc)), 'upload_started': False,
+                    'next_action': '核对 ocv_connection 中当前生效授权；由用户配置精确文件或目录后重新连接，不绕过白名单。'}
+
+    def operations(self, group='', offset=0, limit=30):
+        client, _ = self.connect()
+        client.close()
+        rows = [{'name': op.name, 'description': op.description, 'access': op.access,
+                 'enabled': self.allowed(op), 'transfer': op.transfer}
+                for op, _ in self.bound.values() if not group or op.name.startswith('ocv_' + group)]
+        return {'total': len(rows), 'items': rows[offset:offset+limit],
+                'next_offset': offset+limit if offset+limit < len(rows) else None}
+
+    def describe(self, operation):
+        check_operation_name(operation)
+        client, _ = self.connect()
+        client.close()
+        op, schema = self.operation_contract(operation)
+        return {'name': op.name, 'description': op.description, 'access': op.access,
+                'enabled': self.allowed(op), 'input_schema': schema,
+                'method': op.method, 'endpoint': op.path,
+                'workflow': 'read' if op.access == 'read' else 'prepare -> review -> commit -> receipt -> native task status',
+                'warning': '保留原生权限、revision、时间轴和素材校验；无法得知尚未保存的页面编辑。'}
+
+    def operation_contract(self, operation):
+        check_operation_name(operation)
+        if operation not in self.bound:
+            raise OperationError(operation, 'OPERATION_UNAVAILABLE',
+                f'当前 OCV 未提供 {operation} 的可用接口或完整参数契约。',
+                '请调用 ocv_connection 刷新目录，并从 ocv_operations 选择可用操作；'
+                '若刚更新软件，请加载新版 OCV 服务后重新连接 MCP。')
+        return self.bound[operation]
+
+    def validate(self, operation, arguments):
+        op, schema = self.operation_contract(operation)
+        no_credentials(arguments)
+        if operation == 'ocv_bridge_draft_save':
+            parameters_schema = schema['properties']['body']['properties']['parameters']
+            body = arguments.get('body')
+            parameters = body.get('parameters') if isinstance(body, dict) else None
+            if isinstance(parameters, dict):
+                managed = set(parameters).intersection(parameters_schema.get('x-server-managed-fields', {}))
+                if managed:
+                    raise ValueError('参数不符合 OCV 契约：以下草稿字段由服务端自动设置，不得提交：'
+                                     + ', '.join(sorted(managed)) + '；请仅提交 parameters.properties 中的可写字段。')
+        errors = sorted(Draft202012Validator(schema).iter_errors(arguments), key=lambda e: str(e.path))
+        if errors:
+            raise ValueError('参数不符合 OCV 契约：' + '; '.join(f'{list(e.path)}: {e.message}' for e in errors[:5]))
+        for value in arguments.get('path', {}).values():
+            if not isinstance(value, (str, int)) or str(value) in {'.', '..'} or re.search(r'[/\\%?#\x00-\x1f]', str(value)):
+                raise ValueError('路径参数包含非法字符')
+        if not self.allowed(op):
+            raise ValueError('此操作未获 MCP 启动配置授权；请由用户开启写入/生成/删除权限')
+        if op.name=='ocv_video_vibe_design' and arguments.get('body',{}).get('engine')=='model' and arguments['body'].get('confirm_model') is not True:
+            raise ValueError('模型设计将向项目语言渠道发送本镜资料，可能计费。必须先取得用户同意并传 confirm_model=true，或使用 local。')
+        return op
+
+    def route(self, op, args):
+        path = op.path
+        for key, value in args.get('path', {}).items():
+            path = path.replace('{' + key + '}', quote(str(value), safe=''))
+        if '{' in path:
+            raise ValueError('缺少路径参数')
+        return path
+
+    def upload_file(self, arguments):
+        raw = Path(arguments['local_path'])
+        if not raw.is_absolute():
+            raise ValueError('上传路径必须是绝对路径')
+        file = raw.resolve(strict=True)
+        if file not in self.upload_files and not any(root in file.parents for root in self.upload_roots):
+            raise ValueError('文件不在用户授权的上传目录内')
+        if not file.is_file() or file.suffix.lower() not in UPLOAD_EXTENSIONS:
+            raise ValueError('不支持该上传文件类型')
+        if file.stat().st_size > 100 * 1024 * 1024:
+            raise ValueError('单次上传上限 100 MB；具体入口可能有更低限制')
+        return file
+
+    def guard(self, client, op, arguments):
+        path = arguments.get('path', {})
+        if op.name == 'ocv_video_vibe_cloud_stop':
+            # This endpoint targets an immutable task ID and checks ownership.
+            # Unrelated project edits must not prevent stopping that old task.
+            result = {k: path[k] for k in ('identity', 'shot_id', 'task_id')}
+        elif 'identity' in path and ('/video-studio/' in op.path or '/codex-bridge/projects/' in op.path):
+            record = client.call('GET', '/api/codex-bridge/projects/' + quote(str(path['identity']), safe='') + '/pack')
+            result = {k: record.get(k) for k in ('id', 'revision', 'status', 'timeline_token')}
+        elif 'job_id' in path:
+            record = client.call('GET', '/api/jobs/' + quote(str(path['job_id']), safe=''))
+            # Guard between preparation and submission. Atomic endpoint guards
+            # still apply; this is not a replacement for a backend transaction.
+            if op.name == 'ocv_job_cancel':
+                result = {k: record.get(k) for k in ('id', 'created_at', 'run_id')}
+                result['configuration'] = digest({k: v for k, v in record.get('request', {}).items() if not k.startswith('_')})
+            elif op.name == 'ocv_tts_cancel':
+                task = client.call('GET', '/api/jobs/' + quote(str(path['job_id']), safe='') + '/tts-editor/status')
+                result = {'id': record.get('id'), 'task_id': task.get('task', {}).get('task_id')}
+            else:
+                result = {k: record.get(k) for k in ('id', 'status', 'updated_at', 'step')}
+        else:
+            result = {}
+        if op.transfer == 'upload':
+            file = self.upload_file(arguments)
+            result['upload_sha256'] = hashlib.sha256(file.read_bytes()).hexdigest()
+        return result
+
+    def compact(self, owner, payload):
+        payload = clean(payload)
+        text = json.dumps(payload, ensure_ascii=False)
+        if len(text) <= 18000:
+            return {'data': payload}
+        ident = self.state.put_result(owner, payload)
+        summary = {k: payload[k] for k in ('id', 'status', 'revision', 'message', 'error') if isinstance(payload, dict) and k in payload}
+        return {'result_id': ident, 'summary': summary, 'characters': len(text),
+                'root_keys': list(payload)[:80] if isinstance(payload, dict) else None,
+                'instruction': '使用 ocv_result 按 JSON pointer 读取字段或分页列表；完整结果未丢弃。'}
+
+    def execute(self, client, owner, op, arguments, upload_sha256=None):
+        kwargs = {'params': arguments.get('query', {})}
+        if 'body' in arguments:
+            kwargs['json'] = arguments['body']
+        path = self.route(op, arguments)
+        if op.transfer == 'upload':
+            file = self.upload_file(arguments)
+            # Freeze the exact bytes inspected in prepare, rather than streaming
+            # a mutable source file after the guard check.
+            with file.open('rb') as handle:
+                data = handle.read(100 * 1024 * 1024 + 1)
+            if len(data) > 100 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != upload_sha256:
+                raise ValueError('上传内容在确认后变化，未发送文件')
+            kwargs.update(data={k: (json.dumps(v) if not isinstance(v, str) else v)
+                                for k, v in arguments.get('form', {}).items()},
+                          files={'file': ('upload' + file.suffix.lower(), data,
+                                          mimetypes.guess_type(file.name)[0] or 'application/octet-stream')})
+            return self.compact(owner, client.call(op.method, path, **kwargs))
+        if op.transfer == 'download':
+            folder = self.state.folder / 'assets' / owner
+            folder.mkdir(parents=True, exist_ok=True)
+            file, mime_or_payload = client.download(op.method, path, folder, **kwargs)
+            return {'asset': self.state.add_asset(owner, file, mime_or_payload)} if file else self.compact(owner, mime_or_payload)
+        payload = client.call(op.method, path, **kwargs)
+        if op.name == 'ocv_creation_options':
+            # /settings historically includes recent cross-project text and
+            # local script names: expose only public creation choices.
+            payload = {'tts': payload.get('tts', {}), 'model_options': payload.get('model_options', []),
+                       'visual_modes': payload.get('visual_prompt', {}).get('modes', {})}
+        elif op.name == 'ocv_vibe_model':
+            payload = {k: payload[k] for k in ('base_url', 'model', 'max_image_requests', 'configured', 'source',
+                'generation_policy','image_generation_enabled','effective_max_image_requests') if k in payload}
+        return self.compact(owner, payload)
+
+    def read(self, operation, arguments):
+        check_operation_name(operation)
+        client, owner = self.connect()
+        try:
+            op = self.validate(operation, arguments)
+            if op.access != 'read':
+                raise ValueError('写操作必须先 prepare，再 commit')
+            return self.execute(client, owner, op, arguments)
+        except ApiError as exc:
+            self.forget_auth(exc)
+            raise
+        finally:
+            client.close()
+
+    def prepare(self, operation, arguments, request_id):
+        check_operation_name(operation)
+        if not re.fullmatch(r'[A-Za-z0-9_-]{8,100}', request_id):
+            raise ValueError('request_id 必须为 8～100 位字母、数字、下划线或连字符')
+        client, owner = self.connect()
+        try:
+            cost_schema = None
+            if operation == 'ocv_video_vibe_cloud_create' and isinstance(arguments.get('body'), dict):
+                _, schema = self.operation_contract(operation)
+                cost_schema = schema
+                mode = schema.get('properties', {}).get('body', {}).get('properties', {}).get('template_mode', {})
+                if mode.get('default') == 'shotcraft' and 'template_mode' not in arguments['body']:
+                    # Apply only while preparing a new approval. commit() must
+                    # execute saved plans exactly as originally approved.
+                    arguments = {**arguments, 'body': {**arguments['body'], 'template_mode': 'shotcraft'}}
+            op = self.validate(operation, arguments)
+            if op.access == 'read':
+                raise ValueError('读取操作直接使用 ocv_read')
+            guard = self.guard(client, op, arguments)
+            plan = self.state.prepare(owner, request_id, digest([operation, arguments]), operation, arguments, guard)
+            return {**self.receipt_data(owner, plan), 'description': op.description, 'arguments': clean(arguments),
+                    'guard': json.loads(plan['guard']),
+                    'state_changed_since_prepare': guard != json.loads(plan['guard']),
+                    'requires_confirmation': op.access in {'generate', 'delete'} or op.name in CONFIRM_FORMAL_EDITS,
+                    'cost': operation_cost(op, arguments, cost_schema),
+                    'native_validation': '尚未提交原生接口；业务条件仍以提交时的 OCV 校验为准',
+                    'expires_at': plan['created'] + 600}
+        finally:
+            client.close()
+
+    def receipt_data(self, owner, plan):
+        with self.active_lock:
+            active = plan['id'] in self.active
+        result = {'plan_id': plan['id'], 'request_id': plan['request_id'], 'operation': plan['operation'],
+                  'status': plan['status'], 'adapter_request_running': active}
+        if plan['result']:
+            result['result'] = json.loads(plan['result'])
+        if plan['status'] == 'submitting' and not active:
+            result['warning'] = '提交结果尚未确认（可能在另一连接执行或连接已中断）；请查原生任务状态，不会自动重发。'
+        if plan['status'] == 'submitted':
+            result['note'] = '这是原生接口提交回执，不代表配音、图片、视频或渲染任务已经完成；继续查询相应 status/get/logs。'
+        return result
+
+    def commit(self, plan_id, confirmed=False):
+        client, owner = self.connect()
+        transferred = False
+        try:
+            plan = self.state.get(owner, plan_id)
+            if plan['status'] != 'prepared':
+                return self.receipt_data(owner, plan)
+            args = json.loads(plan['arguments'])
+            op = self.validate(plan['operation'], args)
+            if time.time() > plan['created'] + 600:
+                raise ValueError('预览已过期，请核对当前状态后使用新的 request_id 准备')
+            if (op.access in {'generate', 'delete'} or op.name in CONFIRM_FORMAL_EDITS) and not confirmed:
+                raise ValueError('此操作必须取得用户对本计划的明确授权后 confirmed=true')
+            guard = self.guard(client, op, args)
+            with self.dispatch_lock:
+                latest = self.state.get(owner, plan_id)
+                if latest['status'] != 'prepared':
+                    return self.receipt_data(owner, latest)
+                if guard != json.loads(plan['guard']):
+                    raise ValueError('项目/最终配音/上传文件在预览后已变化，请重新读取并准备；未提交')
+                if not self.slots.acquire(blocking=False):
+                    raise ValueError('MCP 同时提交请求已达 4 个，请稍后查询并重试同一计划')
+                if not self.state.claim(owner, plan_id):
+                    self.slots.release()
+                    return self.receipt_data(owner, self.state.get(owner, plan_id))
+            with self.active_lock:
+                self.active.add(plan_id)
+
+            def submit():
+                try:
+                    if op.name == 'ocv_job_cancel' and guard.get('run_id'):
+                        args.setdefault('query', {})['expected_run_id'] = guard['run_id']
+                    result = self.execute(client, owner, op, args, guard.get('upload_sha256'))
+                    self.state.finish(owner, plan_id, 'submitted', result)
+                except ApiError as exc:
+                    self.forget_auth(exc)
+                    # Server 5xx can occur after side effects; never blindly retry.
+                    self.state.finish(owner, plan_id, 'failed' if 400 <= exc.status < 500 else 'unknown',
+                                      {'http_status': exc.status, 'error': exc.detail})
+                except Exception as exc:
+                    self.state.finish(owner, plan_id, 'unknown',
+                                      {'error': clean(str(exc)), 'advice': '查询原生任务/素材状态；禁止把网络超时当作未提交而自动重试'})
+                finally:
+                    client.close()
+                    with self.active_lock:
+                        self.active.discard(plan_id)
+                    self.slots.release()
+
+            worker = threading.Thread(target=submit, name='ocv-mcp-submit', daemon=True)
+            try:
+                worker.start()
+            except Exception:
+                with self.active_lock:
+                    self.active.discard(plan_id)
+                self.slots.release()
+                self.state.finish(owner, plan_id, 'failed', {'error': '提交工作线程未启动；没有发送请求'})
+                raise
+            transferred = True
+            return self.receipt_data(owner, self.state.get(owner, plan_id))
+        finally:
+            if not transferred:
+                client.close()
+
+    def receipt(self, plan_id):
+        client, owner = self.connect()
+        client.close()
+        return self.receipt_data(owner, self.state.get(owner, plan_id))
+
+    def discard(self, plan_id):
+        client, owner = self.connect()
+        client.close()
+        return {'discarded': self.state.discard(owner, plan_id),
+                'note': '只丢弃尚未提交的 MCP 计划。运行任务请使用原生 cancel/stop 操作。'}
+
+    def result(self, result_id, pointer='', offset=0, limit=20):
+        client, owner = self.connect()
+        client.close()
+        value = self.state.get_result(owner, result_id)
+        if pointer:
+            if not pointer.startswith('/'):
+                raise ValueError('pointer 必须是 JSON pointer，如 /shots/0 或 /logs')
+            walked = ''
+            for raw in pointer[1:].split('/'):
+                key = raw.replace('~1', '/').replace('~0', '~')
+                if isinstance(value, list):
+                    if not re.fullmatch(r'\d+', key) or int(key) >= len(value):
+                        raise ValueError(f'JSON pointer {pointer} 在 {walked or "/"} 处无效：这里是长度 {len(value)} 的列表，'
+                                         f'请使用 0～{max(0, len(value) - 1)} 的序号。')
+                    value = value[int(key)]
+                elif isinstance(value, dict):
+                    if key not in value:
+                        keys = list(value)[:40]
+                        raise ValueError(f'JSON pointer {pointer} 在 {walked or "/"} 处找不到字段 {key!r}；'
+                                         f'可用字段：{", ".join(map(str, keys))}{" …" if len(value) > 40 else ""}')
+                    value = value[key]
+                else:
+                    raise ValueError(f'JSON pointer {pointer} 在 {walked or "/"} 处已是 {type(value).__name__} 值，不能继续向下读取。')
+                walked += '/' + raw
+        if isinstance(value, list):
+            items, size = [], 0
+            for item in value[offset:offset+limit]:
+                count = len(json.dumps(item, ensure_ascii=False))
+                if size + count > 18000:
+                    if not items:
+                        return {'total': len(value), 'oversized_item_pointer': pointer + '/' + str(offset),
+                                'keys': list(item)[:80] if isinstance(item, dict) else None,
+                                'instruction': '单项较大，请继续读取该 pointer 下的具体字段'}
+                    break
+                items.append(item)
+                size += count
+            next_offset = offset + len(items)
+            return {'items': items, 'total': len(value),
+                    'next_offset': next_offset if next_offset < len(value) else None}
+        if isinstance(value, str) and len(value) > 18000:
+            return {'text': value[offset:offset+18000], 'characters': len(value),
+                    'next_offset': offset+18000 if offset+18000 < len(value) else None}
+        if len(json.dumps(value, ensure_ascii=False)) > 18000:
+            return {'keys': list(value), 'instruction': '结果仍较大，请使用更具体的 JSON pointer'}
+        return {'data': value}
+
+    def asset(self, asset_id):
+        client, owner = self.connect()
+        client.close()
+        item = self.state.asset(owner, asset_id)
+        path = Path(item['filename']).resolve()
+        if self.state.folder / 'assets' / owner not in path.parents or not path.is_file():
+            raise ValueError('素材不可用或路径无效')
+        if path.stat().st_size > 8 * 1024 * 1024:
+            raise ValueError('内联预览上限 8 MB，请通过下载回执中的本地文件预览')
+        return path, item['mime']

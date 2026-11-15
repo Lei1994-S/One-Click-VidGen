@@ -95,6 +95,13 @@ namespace OcvLauncher
         private static readonly int[] ManagedPorts = { 8010, 5173, 8030 };
         private static readonly string[] ReleaseIntegrityFiles =
         {
+            "backend/app/illustrated_transitions.py",
+            "backend/app/vibe_agent_diagnostics.py",
+            "backend/app/vibe_transition_source.py",
+            "backend/app/vibe_transitions.py",
+            "backend/app/video_bookends.py",
+            "frontend/src/components/VideoBookends.vue",
+            "frontend/src/narrationFollow.js",
             "OCV_Launcher.exe",
             "start_windows.bat",
             "frontend/src/App.vue",
@@ -128,6 +135,13 @@ namespace OcvLauncher
             "frontend/src/videoPromptWarnings.js",
             "frontend/src/serialTaskQueue.js",
             "frontend/src/rhWorkflowResolution.js",
+            "frontend/src/components/ShotResultOverview.vue",
+            "frontend/src/components/TtsStructureControls.vue",
+            "backend/app/narration_structure.py",
+            "backend/app/tts_structure_edit.py",
+            "backend/app/final_narration.py",
+            "backend/app/video_audio_sync.py",
+            "tools/launcher_service_probe.py",
             "backend/app/comfyui_bridge.py",
             "backend/app/h3_prompt_agent.py",
             "backend/app/presenter_mode.py",
@@ -136,6 +150,7 @@ namespace OcvLauncher
             "backend/vendor/pypinyin/pinyin_dict.json",
             "backend/vendor/pypinyin/phrases_dict.json",
               "backend/app/main.py",
+            "backend/app/release_version.py",
               "backend/app/language_presets.py",
             "backend/app/gemini_client.py",
             "backend/app/image_profiles.py",
@@ -180,6 +195,7 @@ namespace OcvLauncher
             "module6_dynamic_video.py",
             "launcher/safe_update_helper.ps1",
             "launcher/update-sources.json",
+            "launcher/optional-components.json",
             "tools/deploy_indextts25.ps1",
             "tools/portable_preflight.py",
             "backend/app/codex_bridge.py",
@@ -198,12 +214,36 @@ namespace OcvLauncher
             "plugins/codex_bridge/plugin.json",
             "plugins/codex_bridge/ocv_bridge.py",
             "plugins/codex_bridge/README.md",
+            "plugins/codex_bridge/README_MCP.md",
+            "plugins/codex_bridge/AI_GUIDE.md",
+            "plugins/codex_bridge/mcp_server.py",
+            "plugins/codex_bridge/mcp-requirements.txt",
+            "plugins/codex_bridge/ocv_mcp/__init__.py",
+            "plugins/codex_bridge/ocv_mcp/adapter.py",
+            "plugins/codex_bridge/ocv_mcp/catalog.py",
+            "plugins/codex_bridge/ocv_mcp/contracts.py",
+            "plugins/codex_bridge/ocv_mcp/guidance.py",
+            "plugins/codex_bridge/ocv_mcp/server.py",
+            "plugins/codex_bridge/ocv_mcp/state.py",
+            "tools/setup_ocv_mcp.ps1",
             "plugins/codex_bridge/skills/ocv-production-bridge/SKILL.md",
             "plugins/codex_bridge/skills/ocv-production-bridge/agents/openai.yaml",
             "comfyui_plugins/README.md",
             "comfyui/README.md",
             "tts/README.md",
-            "tools/migrate_optional_components.ps1"
+            "tools/migrate_optional_components.ps1",
+            "backend/app/vibe_rmbg.py",
+            "backend/app/vibe_rmbg_runtime.py",
+            "backend/app/vibe_rmbg_model.py",
+            "tools/rmbg/README.md",
+            "tools/rmbg/worker.py",
+            "tools/rmbg/setup_runtime.py",
+            "tools/rmbg/runtime-spec.json",
+            "tools/rmbg/vendor/birefnet/birefnet.py",
+            "tools/rmbg/vendor/birefnet/BiRefNet_config.py",
+            "tools/rmbg/vendor/birefnet/config.json",
+            "tools/rmbg/vendor/birefnet/LICENSE",
+            "tools/rmbg/vendor/birefnet/NOTICE.md"
         };
         private readonly string root;
 
@@ -271,12 +311,16 @@ namespace OcvLauncher
         {
             get
             {
-                string version = ReadPackageVersion();
-                string commit = ReadGitCommit();
-                if (!string.IsNullOrEmpty(commit)) return "v" + version + " · " + commit;
                 string release = ReadLocalReleaseId();
-                if (!string.IsNullOrEmpty(release)) return "OCV " + release + " · L" + version + " · 便携";
-                return "OCV 未标记版本 · L" + version + " · 便携";
+                string version = string.IsNullOrEmpty(release) ? "OCV 未标记版本" : "OCV " + release;
+                string commit = ReadGitCommit();
+                if (!string.IsNullOrEmpty(commit)) {
+                    string suffix = "";
+                    try { int code; string dirty = RunAndCapture("git.exe", "status --porcelain --untracked-files=no", root, 3000, out code);
+                        if (code == 0 && !string.IsNullOrWhiteSpace(dirty)) suffix = " · 本地修改版"; } catch { }
+                    return version + " · " + commit + suffix;
+                }
+                return version + " · 便携";
             }
         }
 
@@ -285,7 +329,7 @@ namespace OcvLauncher
             if (!File.Exists(StartScript)) throw new FileNotFoundException("找不到 start_windows.bat", StartScript);
 
             var info = new ProcessStartInfo();
-            info.FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe";
+            info.FileName = WindowsToolPath("cmd.exe");
             // Run the batch file by name from its working directory.  Passing the
             // absolute path through cmd /c makes directory names such as
             // "One-click VidGen (1)" part of CMD's command grammar, where the
@@ -529,7 +573,7 @@ namespace OcvLauncher
             if (!string.IsNullOrWhiteSpace(plan.PackagePath)) arguments.Append(" -PackagePath ").Append(QuoteArgument(plan.PackagePath));
 
             var info = new ProcessStartInfo();
-            info.FileName = "powershell.exe";
+            info.FileName = WindowsToolPath("powershell.exe");
             info.Arguments = arguments.ToString();
             info.WorkingDirectory = root;
             info.UseShellExecute = true;
@@ -637,7 +681,7 @@ namespace OcvLauncher
 
         private string ReadGitCommit()
         {
-            if (!Directory.Exists(Path.Combine(root, ".git"))) return string.Empty;
+            if (!Directory.Exists(Path.Combine(root, ".git")) && !File.Exists(Path.Combine(root, ".git"))) return string.Empty;
             try
             {
                 int exitCode;
@@ -1016,7 +1060,7 @@ namespace OcvLauncher
             string extension = Path.GetExtension(path).ToLowerInvariant();
             bool isText = extension == ".bat" || extension == ".css" || extension == ".js"
                 || extension == ".cjs" || extension == ".json" || extension == ".ps1" || extension == ".py"
-                || extension == ".vue" || extension == ".md" || extension == ".yaml";
+                || extension == ".vue" || extension == ".md" || extension == ".yaml" || extension == ".txt";
             if (!isText) return ComputeFileSha256(path);
 
             string text = File.ReadAllText(path, Encoding.UTF8)
@@ -1118,7 +1162,7 @@ namespace OcvLauncher
             var result = new HashSet<int>();
             int exitCode;
             string output = RunAndCapture("netstat.exe", "-ano -p tcp", Environment.CurrentDirectory, 10000, out exitCode);
-            if (exitCode != 0) return result;
+            if (exitCode != 0) throw new InvalidOperationException("无法检查 OCV 端口，已取消操作：" + output);
 
             foreach (string rawLine in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
             {
@@ -1167,10 +1211,31 @@ namespace OcvLauncher
             }
         }
 
+        private static string WindowsToolPath(string fileName)
+        {
+            string relative;
+            switch (fileName.ToLowerInvariant())
+            {
+                case "netstat.exe":
+                case "taskkill.exe":
+                case "cmd.exe":
+                    relative = fileName;
+                    break;
+                case "powershell.exe":
+                    relative = Path.Combine("WindowsPowerShell", "v1.0", fileName);
+                    break;
+                default:
+                    return fileName;
+            }
+            string full = Path.Combine(Environment.SystemDirectory, relative);
+            if (!File.Exists(full)) throw new FileNotFoundException("缺少 Windows 系统工具，已取消操作", full);
+            return full;
+        }
+
         private static string RunAndCapture(string fileName, string arguments, string workingDirectory, int timeoutMs, out int exitCode)
         {
             var info = new ProcessStartInfo();
-            info.FileName = fileName;
+            info.FileName = WindowsToolPath(fileName);
             info.Arguments = arguments;
             info.WorkingDirectory = workingDirectory;
             info.UseShellExecute = false;

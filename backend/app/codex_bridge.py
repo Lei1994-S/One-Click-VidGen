@@ -24,6 +24,28 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROOT = PROJECT_ROOT / 'workspace' / 'codex_bridge'
 PLUGIN_ID = 'codex_bridge'
 DRAFT_FIELDS = set('project_name script content_mode video_orientation visual_style_prompt global_character_prompt story_environment_prompt reference_image_ids reference_image_notes reference_image_labels reference_image_kinds tts_engine tts_voice_id tts_speed tts_emotion tts_emotion_weight cluster_voice_type cluster_voice_id qwen_tts_voice qwen_tts_instructions image_resolution video_render_variant video_generation_backend comfyui_profile_id dynamic_text_mode scene_references_enabled'.split())
+DRAFT_SERVER_PARAMETERS = {'dynamic_video': True, 'step_mode': True,
+                           'dynamic_auto_advance': False, 'skip_tts': False}
+
+
+def draft_parameters_schema(schema):
+    # Resolve lazily: main imports this router, but defines GenerateRequest
+    # before OpenAPI/schema generation. Keep types/limits tied to native inputs.
+    from .main import GenerateRequest
+    native = GenerateRequest.model_json_schema()['properties']
+    properties = {key: copy.deepcopy(native[key]) for key in sorted(DRAFT_FIELDS)}
+    for key in ('project_name', 'script'):
+        properties[key].pop('default', None)
+        properties[key].update(minLength=1, pattern=r'\S')
+    properties['script']['maxLength'] = 12000
+    properties['content_mode']['default'] = 'general'
+    schema.update(type='object', properties=properties, required=['project_name', 'script'],
+                  additionalProperties=False,
+                  description='仅提交此处列出的可写初始参数。读取草稿的 parameters 是结果快照，不能原样回传；'
+                              'dynamic_video、step_mode、dynamic_auto_advance、skip_tts 由服务端设置，不得提交。')
+    schema['x-server-managed-fields'] = {
+        key: {'readOnly': True, 'const': value, 'description': '服务端自动设置；不属于可写参数'}
+        for key, value in DRAFT_SERVER_PARAMETERS.items()}
 
 
 class StrictModel(BaseModel):
@@ -34,7 +56,7 @@ class Draft(StrictModel):
     # Caller-chosen UUID makes retry after an uncertain network response safe.
     id: str = Field(pattern=r'^[a-f0-9]{32}$')
     revision: int = Field(default=0, ge=0)
-    parameters: dict[str, Any]
+    parameters: dict[str, Any] = Field(json_schema_extra=draft_parameters_schema)
 
 
 class DraftArchive(StrictModel):
@@ -66,11 +88,17 @@ class AudioHandoff(StrictModel):
     audio_confirmed: Literal[True]
 
 
+class ImageReferenceContext(StrictModel):
+    use_current_image: bool = False
+    use_scene_reference: bool = True
+
+
 class ShotPatch(StrictModel):
     id: str = Field(pattern=r'^[A-Za-z0-9_-]{1,80}$')
     intent: str | None = Field(default=None, min_length=1, max_length=3000)
     image_prompt: str | None = Field(default=None, min_length=1, max_length=20000)
     reference_ids: list[str] | None = Field(default=None, max_length=4)
+    image_reference_context: ImageReferenceContext | None = None
     motion_plan: dict[str, Any] | None = None
     video_prompt: str | None = Field(default=None, max_length=20000)
     evidence: str | None = Field(default=None, max_length=6000)
@@ -112,7 +140,7 @@ def enabled():
 def user_for(request):
     user = require_user(request)
     if not enabled():
-        raise HTTPException(404, 'Codex 制作桥未安装或已停用，请在插件与设置中启用')
+        raise HTTPException(404, 'AI 制作桥未安装或已停用，请在插件与设置中启用')
     return user
 
 
@@ -176,9 +204,12 @@ def compact_pack(record, path):
 @router.get('/info')
 def info(request: Request):
     user_for(request)
-    return {'version': 1, 'name': 'Codex 制作桥', 'client_path': str(PROJECT_ROOT / 'plugins' / PLUGIN_ID / 'ocv_bridge.py'),
+    return {'version': 1, 'name': 'AI 制作桥', 'client_path': str(PROJECT_ROOT / 'plugins' / PLUGIN_ID / 'ocv_bridge.py'),
             'skill_path': str(PROJECT_ROOT / 'plugins' / PLUGIN_ID / 'skills' / 'ocv-production-bridge' / 'SKILL.md'),
             'guide_url': '/api/codex-bridge/guide',
+            'ai_guide_path': str(PROJECT_ROOT / 'plugins' / PLUGIN_ID / 'AI_GUIDE.md'),
+            'ai_guide_url': '/api/codex-bridge/ai-guide',
+            'ai_start': 'MCP 先调用 ocv_guide(topic="start")；旧桥接先读取 ai-guide，再查询 schema。',
             'capabilities': ['drafts', 'draft_archive', 'audio_handoff', 'compact_pack', 'validate', 'apply', 'shot_patch', 'scene_management', 'image_generation',
                              'shot_pack', 'project_image_upload', 'atomic_shot_image_patch', 'reference_preview', 'patch_verification'],
             'plugin_version': '1.6.0', 'max_image_concurrency': 7, 'upstream_task_cancel_supported': False,
@@ -197,6 +228,16 @@ def guide(request: Request):
     return {'name': 'ocv-production-bridge', 'skill_path': str(path), 'content': content}
 
 
+@router.get('/ai-guide')
+def ai_guide(request: Request, topic: Literal['start', 'capabilities', 'protocol', 'workflows', 'audio', 'references', 'recovery', 'bridge', 'all'] = 'start'):
+    user_for(request)
+    from plugins.codex_bridge.ocv_mcp.guidance import read_guide
+    try:
+        return read_guide(topic, path=PROJECT_ROOT / 'plugins' / PLUGIN_ID / 'AI_GUIDE.md')
+    except (OSError, ValueError) as exc:
+        raise HTTPException(404, 'AI 制作说明书缺失或不完整，请检查更新') from exc
+
+
 @router.get('/schema')
 def schema(request: Request):
     user_for(request)
@@ -206,12 +247,14 @@ def schema(request: Request):
             'image_batch': ImageBatch.model_json_schema(), 'generation_settings': GenerationSettings.model_json_schema(),
             'image_batch_control': BatchControl.model_json_schema(),
             'draft_fields': sorted(DRAFT_FIELDS),
+            'draft_server_managed_fields': dict(DRAFT_SERVER_PARAMETERS),
             'motion_example': {'version': 2, 'scene_anchor': '固定构图，显示本镜空间关系',
                 'participants': ['主体'], 'reference_participants': ['主体'], 'reference_texts': [],
                 'reference_beat': 1, 'reference_visual': '主体处于初始状态',
                 'beats': [{'action': '主体发生本镜所需的可见变化，镜头保持稳定', 'texts': []}]},
             'text_entry_example': {'text': '短标签', 'owner': '主体', 'container': '画面标注'},
-            'notes': ['静态镜头不填 motion_plan/video_prompt。动态必须填写 motion_plan。',
+            'notes': ['draft.parameters 只接受 draft_fields；读取结果中的 draft_server_managed_fields 不得回传，即使值未变。',
+                      '静态镜头不填 motion_plan/video_prompt。动态必须填写 motion_plan。',
                       'shot_patch 只提交稳定 id 与要改的字段；禁止字幕、时间、动静类型、素材路径和生成设置。',
                       '局部返修 image_prompt 图号按本次 reference_ids 顺序；更换引用必须同时提交提示词。',
                       'reference_ids 支持 project、redraw 和 image-upload 返回的当前项目暂存 ID；上传不改版本，提交绑定时纳入素材库。',
@@ -254,10 +297,14 @@ def draft_put(data: Draft, request: Request):
     from .main import GenerateRequest, list_uploads
     unknown = set(data.parameters) - DRAFT_FIELDS
     if unknown:
-        raise HTTPException(422, '不支持的初始参数：' + ', '.join(sorted(unknown)))
+        managed = unknown.intersection(DRAFT_SERVER_PARAMETERS)
+        detail = '不支持的初始参数：' + ', '.join(sorted(unknown))
+        if managed:
+            detail += '；以下字段由服务端自动设置，不得提交：' + ', '.join(sorted(managed))
+        raise HTTPException(422, detail)
     raw = dict(data.parameters)
-    raw.update(dynamic_video=True, step_mode=True, dynamic_auto_advance=False, skip_tts=False,
-               content_mode=raw.get('content_mode', 'general'))
+    raw.update(DRAFT_SERVER_PARAMETERS)
+    raw.setdefault('content_mode', 'general')
     try:
         checked = GenerateRequest(**raw).model_dump()
     except ValueError as exc:
@@ -313,11 +360,19 @@ def projects(request: Request):
 def audio_tasks(request: Request, page: int = 1):
     user = user_for(request)
     from .pipeline import store
+    from .video_sources import source_readiness
     data = store.list_page(user_id=int(user['id']), page=page, page_size=100)
     return {'page': page, 'total_pages': data.get('total_pages', 1), 'items': [
         {'id': r['id'], 'name': r.get('request', {}).get('project_name', ''),
-         'status': r.get('status'), 'message': r.get('message', '')}
+         'status': r.get('status'), 'message': r.get('message', ''),
+         **source_readiness(int(user['id']), r['id'], include_snapshot=False)}
         for r in data['jobs'] if r.get('request', {}).get('dynamic_video')]}
+
+
+@router.get('/audio-tasks/{job_id}/readiness')
+def audio_task_readiness(job_id: str, request: Request):
+    from .video_sources import source_readiness
+    return source_readiness(int(user_for(request)['id']), job_id)
 
 
 @router.post('/from-audio')
@@ -399,8 +454,11 @@ def compile_plan(record, path, data, user_id=None):
     rows = [s.model_dump(exclude={'evidence'}) for s in data.shots]
     validate_group_structure(rows, record['scenes'])
     scenes = {s['slide_id']: s for s in record['scenes']}
+    reserved = {s['id'] for s in record.get('shots',[]) if s.get('vibe_reserved')}
     for index, row in enumerate(rows):
         row['visual_description'] = row['motion_plan'].get('reference_visual') or row['image_prompt']
+        if row['id'] in reserved:
+            row.update(kind='static',action='',video_prompt='',motion_plan={})
         start, end = float(scenes[row['slide_ids'][0]]['start']), float(scenes[row['slide_ids'][-1]]['end'])
         if index == 0 and start > 0.03:
             raise ValueError('首条字幕前存在空白时间，请先在 OCV 核对配音时间轴')
@@ -426,8 +484,10 @@ def compile_plan(record, path, data, user_id=None):
     if record.get('manual_groups') and [(r['id'], r['slide_ids']) for r in rows] != [(r['id'], r['slide_ids']) for r in record['shots']]:
         raise ValueError('当前项目有手动分组，整体方案必须保留镜头ID与字幕范围')
     refs = [r['id'] for r in studio._material_references(record)]
-    result = audit_storyboard(normalize_shots(rows, record['scenes'], refs), set(refs))
-    return result
+    normalized = normalize_shots(rows, record['scenes'], refs)
+    if reserved:
+        return studio._audit_studio_shots(studio._preserve_vibe(record,normalized), set(refs))
+    return audit_storyboard(normalized, set(refs))
 
 
 def review_plan(identity, data, request, commit):
@@ -460,7 +520,7 @@ def review_plan(identity, data, request, commit):
         updated['codex_bridge'] = {'receipt': receipt, 'applied_revision': updated['revision'], 'backup_id': backup_id, 'at': time.time(),
                                   'evidence': {s.id: s.evidence for s in data.shots if s.evidence}}
         studio.discard_planning_resume(updated)
-        updated.setdefault('logs', []).append('Codex 制作桥：分镜方案已校验导入，配音与字幕未修改，等待人工确认；未启动生成。')
+        updated.setdefault('logs', []).append('AI 制作桥：分镜方案已校验导入，配音与字幕未修改，等待人工确认；未启动生成。')
         studio.save(path, updated)
         actual = read_record(path)
         if actual['shots'] != shots or actual['scenes'] != record['scenes'] or actual.get('audio') != record.get('audio'):
@@ -565,7 +625,12 @@ def compile_patches(record, path, data):
                 raise ValueError(f'{patch.id} 静态镜头不应包含动态阶段/视频提示词')
             # image_upload_id is a transport field, never a storyboard field.
             if changed - {'image_upload_id', 'intent', 'evidence'}:
-                audit_storyboard([row], set(refs))
+                # Saving a draft is not confirmation. Validate its actual design
+                # without letting the pending-review gate prevent its repair.
+                # Keep the real flag until the explicit design/confirm action.
+                candidate = copy.deepcopy(row)
+                candidate['design_needs_review'] = False
+                audit_storyboard([candidate], set(refs))
         if 'image_prompt' in values:
             # Repair uses the same local reference numbering as the native editor.
             row['image_material_numbers_bound'] = True
@@ -576,6 +641,17 @@ def compile_patches(record, path, data):
             selection['reference_ids'] = list(row['reference_ids'])
             selection['use_current_image'] = False
             row['redraw_selection'] = selection
+        if 'image_reference_context' in values:
+            if 'image_prompt' not in values:
+                raise ValueError(f'{patch.id} 修改参考图上下文时须同时提交 image_prompt')
+            row.setdefault('redraw_selection', {}).update(values['image_reference_context'])
+        if 'image_prompt' in values or 'reference_ids' in values:
+            selection = row.get('redraw_selection') or {}
+            row['image_prompt_reference_order'] = (
+                ['current_image:' + row['id']] if selection.get('use_current_image') else []) + [
+                'reference:' + value for value in selection.get('reference_ids', row.get('reference_ids', []))]
+            from .image_reference_binding import context_key
+            row['image_prompt_reference_context_key'] = context_key(row)
         if image_changed:
             row['image_prompt_out_of_sync'] = bool(row.get('image') or row.get('image_file') or row.get('image_status') == 'completed')
             row['image_prompt_warnings'] = []
@@ -627,6 +703,8 @@ def review_patches(identity, data, request, commit):
             return {'ok': False, 'errors': [str(exc)], 'written': False, 'generation_started': False}
         summary = {'ok': True, 'project_id': identity, 'revision': record['revision'], 'changed': [r['id'] for r in impacts],
                    'impacts': impacts, 'written': False, 'generation_started': False,
+                   'design_review_required': [s['id'] for s in updated['shots']
+                                              if s['id'] in {p.id for p in data.shots} and s.get('design_needs_review')],
                    'preserved': ['audio', 'subtitles', 'timing', 'shot_order', 'shot_kind', 'generation_settings', 'asset_files']}
         if not commit:
             summary['reference_checks'] = [reference_preview(path, updated, s) for s in updated['shots'] if s['id'] in summary['changed']]
@@ -655,13 +733,19 @@ def review_patches(identity, data, request, commit):
                     row['baseline_image_prompt'] = old['baseline_image_prompt']
                 materialize_replacement(path, row)
             if impact['video_needs_review']:
-                studio._invalidate_shot_video(updated, row, 'Codex 局部返修已更新画面方案')
-            row['prompt_refresh_note'] = ('Codex 局部返修已保存。' +
+                studio._invalidate_shot_video(updated, row, 'AI 局部返修已更新画面方案')
+            row['prompt_refresh_note'] = ('AI 局部返修已保存。' +
                 ('新图与方案已一起保存，旧图已归档，请核查新图。' if impact['image_replaced'] else
                  '旧图保留，请检查并按新提示词重绘。' if impact['image_needs_review'] else '') +
                 ('旧视频保留在历史记录，请核查后重新生成或手动选用历史版本。' if impact['video_needs_review'] else '') +
                 '配音、字幕、时长与其他镜头未变，未启动生成。')
-        if any(i['image_needs_review'] for i in impacts):
+        # A patch before any core image exists stays in the storyboard stage, so
+        # the normal "confirm storyboard -> generate core images" path remains.
+        pre_image = record['status'] in {'draft', 'storyboard_review', 'generation_ready'} and not any(
+            s.get('image') for s in updated['shots'])
+        if pre_image:
+            pass
+        elif any(i['image_needs_review'] for i in impacts):
             updated['status'] = 'image_review'
         elif any(i['video_needs_review'] for i in impacts):
             updated['status'] = 'video_review'
@@ -676,7 +760,7 @@ def review_patches(identity, data, request, commit):
         summary['readback_verified'] = True
         updated['codex_bridge']['patch_receipt'] = {'receipt': receipt, 'revision': updated['revision'], 'summary': summary}
         studio.discard_planning_resume(updated)
-        updated.setdefault('logs', []).append('Codex 制作桥：局部返修 ' + '、'.join(summary['changed']) + '；素材已保留，未启动生成。')
+        updated.setdefault('logs', []).append('AI 制作桥：局部返修 ' + '、'.join(summary['changed']) + '；素材已保留，未启动生成。')
         try:
             studio.save(path, updated)
             actual = read_record(path)

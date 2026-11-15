@@ -9,8 +9,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .api import router
+from .announcements import router as announcements_router
 from .cloud_video_api import router as cloud_video_router
 from .password_recovery import router as password_recovery_router
+from .referral_program import router as referral_program_router
 from .asr_api import router as asr_router, start_cleanup as start_asr_cleanup
 from .editor_api import router as editor_router, start_cleanup
 from .editor_timeline import router as timeline_router
@@ -36,8 +38,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Ray Cloud Acceleration API", version="0.1.0", docs_url="/api/v1/docs", openapi_url="/api/v1/openapi.json", lifespan=lifespan)
 app.include_router(router)
+app.include_router(announcements_router)
 app.include_router(cloud_video_router)
 app.include_router(password_recovery_router)
+app.include_router(referral_program_router)
 app.include_router(asr_router)
 app.include_router(editor_router)
 app.include_router(timeline_router)

@@ -7,15 +7,91 @@ import math
 import threading
 import time
 import uuid
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from fastapi import HTTPException
 from .cloud_client import cloud_client_for, CloudApiError
 from . import video_studio as studio
+from .h3_limits import fits_dimensions, validate_dimensions
+
+
+def is_cloud_shot(record, shot):
+    saved_backend = (shot.get('video_request') or {}).get('backend')
+    options_backend = (shot.get('video_generation_options') or {}).get('backend')
+    if not shot.get('video_request') and not shot.get('video_task_id') and shot.get('video_execution_started') is False:
+        # A deliberate backend switch can retain the old backend in its history.
+        backend = options_backend or shot.get('video_backend') or record.get('active_video_backend')
+    else:
+        backend = saved_backend or shot.get('video_backend') or options_backend or record.get('active_video_backend')
+    return backend == 'cloud_h3'
+
+
+def not_submitted(shot):
+    """Only positively known pre-submit states are safe to offer as generation."""
+    if shot.get('video_terminal'):
+        # A new attempt can fail before replacing the previous terminal request.
+        return True
+    if shot.get('video_task_id') or shot.get('video_execution_started') is True:
+        return False
+    saved = shot.get('video_request') or {}
+    if saved:
+        # Missing flags on older frozen requests are ambiguous, not proof of no POST.
+        return saved.get('backend') == 'cloud_h3' and shot.get('video_execution_started') is False
+    if shot.get('video_execution_started') is False and not (shot.get('video_state_file') or shot.get('video')):
+        # Invalidating a completed attempt clears the request but keeps its attempt
+        # counter/history, explicitly resetting execution before preparing a new one.
+        return True
+    return not (shot.get('video_state_file') or shot.get('video_attempt') or shot.get('video'))
+
+
+def interrupted_values(shot, *, preparation_message='集群 H3 请求准备已中断，尚未提交视频任务；可重试本镜'):
+    if not_submitted(shot):
+        terminal = bool(shot.get('video_terminal'))
+        saved = shot.get('video_request') or {}
+        return dict(video_status='failed' if terminal else 'pending', video_terminal=terminal,
+                    video_not_submitted=True,
+                    video_resume_available=bool(saved.get('client_job_id')) and not terminal,
+                    video_progress_message=preparation_message, video_finished_at=time.time())
+    return dict(video_status='unknown', video_terminal=False, video_not_submitted=False,
+                video_resume_available=True,
+                video_progress_message='本地查询或下载已中断，尚未确认结果；请继续查询原任务')
+
+
+def recover_unsubmitted(record):
+    """Repair legacy pre-submit errors without contacting a provider or changing assets."""
+    changed = False
+    for index, shot in enumerate(record.get('shots', []), 1):
+        if (shot.get('kind') != 'video' or shot.get('video_status') != 'unknown' or
+                shot.get('video_terminal') or not is_cloud_shot(record, shot) or not not_submitted(shot)):
+            continue
+        shot.update(interrupted_values(shot))
+        message = f'第 {index:02d} 镜（{shot["id"]}）：请求尚未提交，已恢复为可重试；原始错误保留。'
+        record.setdefault('logs', []).append(message)
+        changed = True
+    if changed:
+        record['revision'] += 1
+    return changed
 
 
 def accept_quote(saved, quote, spec):
-    if Decimal(str(quote.get('credits_total', quote.get('credits', '-1')))) != 0 or quote.get('test_mode') is not True:
-        raise ValueError('集群 H3 已不再免费测试，请确认新价格后再接入；本次未提交')
+    try:
+        amount = Decimal(str(quote.get('credits_total', quote.get('credits', '-1'))))
+        duration = Decimal(str(spec['duration_seconds']))
+        legacy_free = amount == 0 and quote.get('test_mode') is True
+        if not legacy_free:
+            pricing = quote['pricing']
+            first, extra = Decimal(str(pricing['first_10_seconds_rate'])), Decimal(str(pricing['additional_seconds_rate']))
+            threshold = Decimal(str(pricing['threshold_seconds']))
+            if (not all(v.is_finite() and v > 0 for v in (amount, first, extra, threshold))
+                    or not pricing.get('version') or pricing.get('currency') != 'CNY'
+                    or pricing.get('duration_basis') != 'requested' or pricing.get('rounding') != 'ceil_cent'):
+                raise ValueError()
+            expected = (min(duration, threshold)*first + max(duration-threshold, Decimal(0))*extra).quantize(Decimal('.01'), rounding=ROUND_CEILING)
+            if amount != expected:
+                raise ValueError()
+        saved['credits'] = str(amount)
+        saved['pricing'] = quote.get('pricing')
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        raise ValueError('集群 H3 报价不符合服务端费率，本次未提交，请刷新价格') from None
     normalized=quote.get('normalized_spec',quote.get('spec',spec))
     if any(normalized.get(key)!=spec[key] for key in ('prompt','reference_image_asset_id','width','height','duration_seconds','seed')):
         raise ValueError('云端报价更改了生成参数，本次未提交，请刷新配置')
@@ -39,6 +115,8 @@ def create_or_renew(client, saved, persist):
         # authorizes a second job because the server also locks that identity.
         spec=saved['spec']
         quote=client.video_quote(spec)
+        if Decimal(str(quote.get('credits_total', quote.get('credits', '-1')))) != Decimal(str(saved.get('credits', '0'))):
+            raise ValueError('原报价已过期且费用发生变化，请确认新价格后重新生成；本次未提交')
         accept_quote(saved,quote,spec)
         persist(saved)
         return client.create_video_job(saved['quote_id'],saved['client_job_id'])
@@ -52,13 +130,16 @@ def workflow(capabilities):
     return result
 
 
-def dimensions_for(capabilities, options, ratio):
+def dimensions_for(capabilities, options, ratio, seconds=14):
     selected = workflow(capabilities)
     raw = selected.get('dimensions') or selected.get('supported_dimensions') or selected.get('resolutions') or []
     allowed = [(int(row['width']), int(row['height'])) if isinstance(row, dict) else tuple(map(int, row)) for row in raw]
+    advertised = list(allowed)
+    allowed = [pair for pair in allowed if fits_dimensions(*pair, seconds)]
     portrait = ratio == '9:16'
     if options.get('resolution') == 'custom':
         dimensions = (options.get('width'), options.get('height'))
+        validate_dimensions(*dimensions, seconds)
     elif options.get('resolution'):
         candidates = [pair for pair in allowed if (pair[1] > pair[0]) == portrait and min(pair) == {'480p':480,'720p':720,'1080p':1080}.get(options['resolution'])]
         if not candidates:
@@ -72,6 +153,9 @@ def dimensions_for(capabilities, options, ratio):
         if defaults is not None:
             default = defaults.get('portrait' if portrait else 'landscape', {})
             dimensions = (default.get('width'), default.get('height'))
+            if dimensions in advertised and not fits_dimensions(*dimensions, seconds):
+                # No saved selection: choose a supported default within this clip's limit.
+                dimensions = max(candidates, key=lambda pair: pair[0]*pair[1])
             if dimensions not in candidates:
                 raise ValueError('集群默认尺寸与能力列表不一致，请刷新配置；不会自动降低分辨率')
         else:
@@ -92,19 +176,25 @@ def validate_duration(shot, selected):
         timeline = float(shot.get('duration') or 0)
         limits = selected.get('duration_seconds') or selected.get('duration', {})
         minimum = max(2, float(selected.get('min_duration_seconds', limits.get('min', 2))))
-        maximum = min(10, float(selected.get('max_duration_seconds', limits.get('max', 10))))
+        maximum = min(14, float(selected.get('max_duration_seconds', limits.get('max', 14))))
     except (TypeError, ValueError, OverflowError):
         raise ValueError('镜头时长无效，请重新规划分镜') from None
     if not all(math.isfinite(value) for value in (seconds, timeline, minimum, maximum)):
         raise ValueError('镜头时长无效，请重新规划分镜')
     if not 0 < timeline <= seconds or not minimum <= seconds <= maximum:
-        raise ValueError('镜头时长超出集群允许范围或请求时长不足以覆盖分镜，请拆分分镜；不会自动裁短')
+        raise ValueError(f"镜头 {shot.get('id', '?')}：画面 {timeline:g} 秒，请求 {seconds:g} 秒，"
+                         f'当前允许 {minimum:g}–{maximum:g} 秒；请拆分分镜（可用“自动拆分”）或调整字幕边界，不会自动裁短')
 
 
 def handles(identity, data, user_id):
     with studio.LOCK:
         record = studio.read(studio.directory(user_id, identity))
-        chosen = [s for s in record['shots'] if s['kind'] == 'video' and (not data.shot_ids or s['id'] in data.shot_ids)]
+        if any(s.get('vibe_reserved') and s['id'] in data.shot_ids for s in record['shots']):
+            raise HTTPException(409, '所选镜头已预留 Vibe，请采用本机动效，或先取消预留再调用视频模型')
+        if any(studio.has_vibe_output(s) and s['id'] in data.shot_ids and
+               (data.regenerate_completed or s.get('video_status') != 'completed') for s in record['shots']):
+            raise HTTPException(409, '所选镜头已采用本机 Vibe 动效；如需切换到视频模型，请先撤回采用')
+        chosen = [s for s in record['shots'] if s['kind'] == 'video' and not studio.has_vibe_output(s) and (not data.shot_ids or s['id'] in data.shot_ids)]
         return any(((data.options or data.shot_options.get(s['id'])).backend if (data.options or data.shot_options.get(s['id'])) else
                    (s.get('video_generation_options') or {}).get('backend') or (s.get('video_request') or {}).get('backend') or
                    record.get('creation_parameters', {}).get('video_generation_backend')) == 'cloud_h3' for s in chosen)
@@ -130,7 +220,7 @@ def generate_cloud(identity, data, user_id):
             raise HTTPException(400, '镜头配置与本次选择不一致')
         if data.regenerate_completed and not data.shot_ids:
             raise HTTPException(400, '重新生成必须明确选择镜头')
-        shots = [s for s in record['shots'] if s['kind']=='video' and (not data.shot_ids or s['id'] in data.shot_ids) and (data.regenerate_completed or s.get('video_status')!='completed')]
+        shots = [s for s in record['shots'] if s['kind']=='video' and not studio.has_vibe_output(s) and (not data.shot_ids or s['id'] in data.shot_ids) and (data.regenerate_completed or s.get('video_status')!='completed')]
         if not shots:
             raise HTTPException(409, '没有需要生成的镜头')
         resolved = {}
@@ -154,8 +244,8 @@ def generate_cloud(identity, data, user_id):
                         raise ValueError('原任务尚未结束，不能更换尺寸，请先查询原任务')
                     resolved[shot['id']] = (options, {'workflow_revision':previous.get('workflow_revision'),'model':previous.get('model')}, frozen_dimensions)
                     continue
-                selected, dimensions = dimensions_for(capabilities, options, record['settings'].get('ratio','16:9'))
-                validate_duration(shot, selected)
+                validate_duration(shot, workflow(capabilities))
+                selected, dimensions = dimensions_for(capabilities, options, record['settings'].get('ratio','16:9'), shot['generation_duration'])
                 from .presenter_mode import audio_policy
                 if audio_policy(record.get('creation_parameters',{}), shot, options['h3_prompt_agent'], record.get('references',[]))[0]:
                     raise ValueError('集群 H3 测试阶段暂不支持参考音频或对口型，请关闭此功能')
@@ -179,39 +269,45 @@ def generate_cloud(identity, data, user_id):
 
 def _worker(path,user_id,identities,resolved,event):
     from . import video_generation as vg
-    client=cloud_client_for(user_id)
     current_id=None
+    stage='集群连接'
     def update(identity, **values):
         with studio.LOCK:
             record=studio.read(path);shot=studio._find_shot(record,identity)
             shot.update(values);record['revision']+=1;studio.save(path,record)
     try:
+        client=cloud_client_for(user_id)
         for identity in identities:
             if event.is_set(): break
             current_id=identity
+            stage='请求准备'
             options,selected,dimensions=resolved[identity]
             with studio.LOCK:
                 record=studio.read(path);live=studio._find_shot(record,identity)
                 if live.get('video_queue_cancelled'):continue
-                update(identity,video_queued=False,video_status='running',video_started_at=time.time(),video_error='',video_progress_message='正在准备集群 H3 请求')
+                update(identity,video_queued=False,video_status='running',video_started_at=time.time(),video_finished_at=None,video_error='',video_progress_message='正在准备集群 H3 请求')
                 record=studio.read(path);shot=copy.deepcopy(studio._find_shot(record,identity))
             saved=shot.get('video_request') or {}
             if not saved or shot.get('video_terminal'):
                 prompt=shot['video_prompt']
                 if options['h3_prompt_agent']:
+                    stage='H3 提示词转换（语言模型）'
+                    update(identity,video_progress_message='正在转换 H3 提示词（语言模型），尚未提交视频任务')
                     with studio.project_language_scope(user_id,studio.planning_parameters(record)):
                         prompt,_=vg.convert_for_h3(shot,int(shot['generation_duration']),image_path=studio._storyboard_image_path(path,shot))
                 if event.is_set(): break
+                stage='本地请求准备'
                 with studio.LOCK:
                     record=studio.read(path);live=studio._find_shot(record,identity)
                     vg._freeze_local_request(path,record,live,'h3-fast',prompt=prompt,prompt_format='h3_ref2va' if options['h3_prompt_agent'] else 'generic',dimensions=dimensions,resolution=options['resolution'])
                     saved=live['video_request'];saved.update(backend='cloud_h3',seed=int(saved['seed']) % (2**32),client_job_id='ocv-h3-'+uuid.uuid4().hex,workflow_revision=selected['workflow_revision'],model=selected.get('model','minimax-h3'))
-                    live.update(video_backend='cloud_h3',video_terminal=False,video_resume_available=True,video_execution_started=False,video_status='running')
+                    live.update(video_backend='cloud_h3',video_terminal=False,video_resume_available=True,video_execution_started=False,video_not_submitted=True,video_status='running')
                     request_file=vg._asset(path,live['video']).parent/'request.json'
                     request_file.write_text(json.dumps(saved,ensure_ascii=False,indent=2),encoding='utf-8')
                     studio.save(path,record);shot=copy.deepcopy(live)
             client_id=saved['client_job_id']
             remote=None
+            stage='原任务查询'
             try:
                 remote=client.video_job(shot['video_task_id']) if shot.get('video_task_id') else client.video_job(client_id,by_client=True)
             except CloudApiError as exc:
@@ -219,36 +315,60 @@ def _worker(path,user_id,identities,resolved,event):
                 if shot.get('video_task_id'): raise ValueError('已保存的云端任务不存在，请联系管理员核实；不会重新提交') from exc
             if remote is None:
                 if event.is_set(): break
+                # Recovery can query old tasks; an absent task must obey today's limits
+                # before any new upload, quote or creation, even with a saved quote ID.
+                try:
+                    validate_dimensions(saved.get('width'), saved.get('height'), saved.get('duration'))
+                except ValueError as exc:
+                    update(identity, video_status='failed', video_terminal=True, video_resume_available=False,
+                           video_error=str(exc), video_progress_message='原任务不存在，保存的参数超出当前限制，请修改后重新生成')
+                    continue
                 if not saved.get('quote_id'):
+                    stage='参考图上传'
                     asset=client.video_asset(vg._asset(path,saved['reference_files'][0]))
                     spec=dict(prompt=saved['prompt'],reference_image_asset_id=asset['asset_id'],width=saved['width'],height=saved['height'],duration_seconds=saved['duration'],seed=saved['seed'])
+                    stage='集群报价核对'
                     quote=client.video_quote(spec)
                     accept_quote(saved,quote,spec)
                     update(identity,video_request=saved)
                 if event.is_set(): break
-                update(identity,video_execution_started=True)
+                stage='集群任务提交'
+                update(identity,video_execution_started=True,video_not_submitted=False)
                 remote=create_or_renew(client,saved,lambda value:update(identity,video_request=value))
+            else:
+                # Even a malformed response is evidence of an existing task.
+                update(identity,video_execution_started=True,video_not_submitted=False)
             remote_id=str(remote.get('id') or remote.get('job_id') or '')
             if not remote_id: raise ValueError('云端返回缺少任务编号，已保留幂等键')
             update(identity,video_task_id=remote_id)
             deadline=time.monotonic()+max(7200,client.config.max_wait_seconds)
             cancel_sent=False
             while True:
+                stage='集群任务查询'
                 state=remote.get('status')
                 update(identity,video_progress_message=str(remote.get('message') or remote.get('stage') or state),video_resume_available=True)
                 if state in {'succeeded','completed'}:
+                    stage='视频结果下载与校验'
                     output=vg._asset(path,shot['video'])
                     client.download_to('/cloud/video/jobs/'+remote_id+'/result',output,max_bytes=1024*1024*1024)
                     from .pipeline import probe_media_duration
-                    if probe_media_duration(output) <= 0:
-                        output.unlink(missing_ok=True);raise ValueError('集群返回的视频无法解码，请继续查询或联系管理员')
-                    expected=(remote.get('result') or {}).get('sha256')
-                    if expected and hashlib.sha256(output.read_bytes()).hexdigest()!=expected:
-                        output.unlink(missing_ok=True);raise ValueError('视频下载校验失败，请继续查询并重新下载原结果')
+                    try:
+                        duration=probe_media_duration(output)
+                        if not math.isfinite(duration) or duration <= 0:
+                            raise ValueError('集群返回的视频无法解码，请继续查询或联系管理员')
+                        expected=(remote.get('result') or {}).get('sha256')
+                        if expected and hashlib.sha256(output.read_bytes()).hexdigest()!=expected:
+                            raise ValueError('视频下载校验失败，请继续查询并重新下载原结果')
+                    except Exception:
+                        output.unlink(missing_ok=True)
+                        raise
                     update(identity,video_status='completed',video_terminal=False,video_resume_available=False,video_version=vg._video_version(output),video_design_changed=False,video_finished_at=time.time(),video_progress_message='集群视频已完成并下载')
                     break
                 if state in {'failed','cancelled','expired'}:
-                    update(identity,video_status='stopped' if state=='cancelled' else 'failed',video_terminal=True,video_resume_available=False,video_error=str(remote.get('error') or remote.get('message') or state),video_finished_at=time.time())
+                    error=remote.get('error')
+                    if isinstance(error,dict):
+                        error='：'.join(str(value) for value in (error.get('code'),error.get('message')) if value)
+                    update(identity,video_status='stopped' if state=='cancelled' else 'failed',video_terminal=True,video_resume_available=False,video_error=str(error or remote.get('message') or state),video_finished_at=time.time())
                     break
                 if event.is_set() and not cancel_sent:
                     remote=client.cancel_video_job(remote_id);cancel_sent=True;continue
@@ -257,10 +377,20 @@ def _worker(path,user_id,identities,resolved,event):
                 remote=client.video_job(remote_id)
             if event.is_set() or state in {'failed','cancelled','expired'}: break
     except Exception as exc:
-        if current_id:
-            update(current_id,video_status='unknown',video_terminal=False,video_resume_available=True,video_error=str(exc)[:1800])
         with studio.LOCK:
-            record=studio.read(path);record['error']=str(exc)[:1800]
+            record=studio.read(path)
+            message=f'{stage}失败：{exc}'[:1800]
+            if current_id:
+                shot=studio._find_shot(record,current_id)
+                index=next(i for i,s in enumerate(record['shots'],1) if s['id']==current_id)
+                message=f'第 {index:02d} 镜（{current_id}）{message}'
+                preparation_message=('H3 提示词转换失败，视频任务尚未提交；可直接重新开始本镜，反复失败时可检查或切换语言模型渠道'
+                                     if stage=='H3 提示词转换（语言模型）' else
+                                     f'{stage}失败，视频任务尚未提交；请检查错误后重试本镜')
+                shot.update(interrupted_values(shot,preparation_message=preparation_message),video_error=message)
+            record['error']=message
+            record.setdefault('logs',[]).append(message)
+            record['revision']+=1
             if isinstance(exc,CloudApiError) and exc.status_code==401: record['cloud_login_required']=True
             studio.save(path,record)
     finally:
@@ -268,7 +398,7 @@ def _worker(path,user_id,identities,resolved,event):
             record=studio.read(path)
             for shot in record['shots']:
                 shot['video_queued']=False
-                if shot.get('video_status')=='running':shot.update(video_status='unknown',video_resume_available=True,video_terminal=False)
+                if shot.get('video_status')=='running':shot.update(interrupted_values(shot))
             record.update(status='video_review',revision=record['revision']+1)
             studio.save(path,record)
             studio.ACTIVE.discard(str(path));studio.CANCEL_EVENTS.pop(str(path),None)

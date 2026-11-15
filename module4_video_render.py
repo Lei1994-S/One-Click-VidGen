@@ -28,6 +28,7 @@ from typing import Any
 import requests
 
 from backend.app.config import load_project_env
+from backend.app import image_request_control as image_control
 from backend.app.gemini_client import GeminiError, gemini_configured, generate_gemini_text, parse_json_response
 from story_agents import (
     STORY_PLAN_PATH,
@@ -277,7 +278,7 @@ def _record_partial_poster_success(
     """Commit one returned image and its mapping before another worker can fail."""
     mapping[index]["asset_filename"] = asset.name
     clean_mapping = [
-        {key: value for key, value in macro.items() if key != "progress_label"}
+        {key: value for key, value in macro.items() if key not in {"progress_label", "_cancel_event"}}
         for macro in mapping
     ]
     _atomic_write_json(POSTER_MAPPING_PATH, clean_mapping)
@@ -745,7 +746,9 @@ class RunningHubAccountPool:
         self._next_lease_id += 1
         self._inflight[key] = self._inflight.get(key, 0) + 1
         self._active_leases[lease_id] = key
-        return {**config, "_lease_id": str(lease_id)}
+        leased = {**config, "_lease_id": str(lease_id)}
+        image_control.on_exit(lambda: self.release(leased))
+        return leased
 
     def _release_locked(self, config: dict[str, str]) -> None:
         try:
@@ -766,6 +769,7 @@ class RunningHubAccountPool:
     def acquire(self) -> dict[str, str]:
         with self._condition:
             while True:
+                image_control.check()
                 usable = [
                     config
                     for config in self._configs
@@ -864,6 +868,7 @@ class RunningHubAccountPool:
         """Choose any non-414 account as the account whose queue will be observed."""
         with self._condition:
             while True:
+                image_control.check()
                 usable = [
                     config
                     for config in self._configs
@@ -2049,6 +2054,14 @@ def _synchronized_reference_image_ids(
     if reference_metadata():
         # Multi-purpose materials are selected by the shot director, not by
         # character names inherited from a broader semantic group.
+        from backend.app.reference_materials import explicit_reference_labels
+        explicit = explicit_reference_labels(original_prompt)
+        unknown = explicit - set(catalog)
+        if unknown:
+            raise ValueError(f"镜头 {item.get('macro_scene_id', '?')} 明确引用了不存在的素材：{'、'.join(sorted(unknown))}")
+        # Only the original shot's explicit instruction is authoritative; do
+        # not bind references merely mentioned in expanded continuity cards.
+        selected.update(explicit)
         if len(selected) > 3:
             raise ValueError('当前镜头参考素材超过3张，请精简选图')
         from backend.app.reference_materials import required_every_shot_labels
@@ -2756,10 +2769,23 @@ def _request_with_cloud_refresh(
     timeout: float = 60,
     **kwargs: Any,
 ) -> requests.Response:
+    return image_control.request(lambda: _request_with_cloud_refresh_impl(
+        session, method, url, config=config, timeout=timeout, **kwargs))
+
+
+def _request_with_cloud_refresh_impl(
+    session: requests.Session,
+    method: str,
+    url: str,
+    *,
+    config: dict[str, str] | None = None,
+    timeout: float = 60,
+    **kwargs: Any,
+) -> requests.Response:
     if config and config.get("cloud_pool") == "1" and config.get("cloud_user_id"):
         from backend.app.cloud_client import CloudApiError, cloud_client_for_image
         try:
-            return cloud_client_for_image(config)._send(method, url, raise_errors=False, **kwargs)
+            return cloud_client_for_image(config)._send(method, url, raise_errors=False, timeout=timeout, **kwargs)
         except CloudApiError as exc:
             if exc.status_code == 401:
                 raise CloudImageLoginRequired() from exc
@@ -2771,12 +2797,13 @@ def _request_with_cloud_refresh(
     headers = dict(kwargs.pop("headers", {}) or {})
     if config and config.get("cloud_pool") == "1":
         headers["Authorization"] = f"Bearer {config['api_key']}"
+    image_control.check()
     response = session.request(method, url, headers=headers, timeout=timeout, **kwargs)
     if response.status_code != 401 or not config or config.get("cloud_pool") != "1":
         return response
     failed_token = config.get("api_key", "")
     response.close()
-    with _CLOUD_TOKEN_REFRESH_LOCK:
+    with image_control.locked(_CLOUD_TOKEN_REFRESH_LOCK):
         if config.get("_cloud_login_required"):
             raise CloudImageLoginRequired()
         if config.get("api_key", "") == failed_token:
@@ -2804,6 +2831,7 @@ def _request_with_cloud_refresh(
                 expires_in = 900
             _persist_cloud_pool_session(config, expires_in=expires_in)
     headers["Authorization"] = f"Bearer {config['api_key']}"
+    image_control.check()
     response = session.request(method, url, headers=headers, timeout=timeout, **kwargs)
     if response.status_code == 401:
         response.close()
@@ -2919,7 +2947,7 @@ def _wait_for_queue_slot(poster_id: str, config: dict[str, str]) -> None:
         flush=True,
     )
     while time.monotonic() < deadline:
-        time.sleep(poll_seconds)
+        image_control.wait(poll_seconds)
         active_tasks = _account_active_task_count(config)
         if active_tasks < blocked_task_count:
             print(
@@ -3166,6 +3194,7 @@ def _download_image(
     except requests.RequestException as exc:
         print(f"{poster_id} 下载网络异常，稍后重试: {type(exc).__name__}", flush=True)
         return None
+    image_control.check()
     output.write_bytes(response.content)
     if output.stat().st_size == 0:
         raise RuntimeError(f"{poster_id} 下载到空图像")
@@ -3314,6 +3343,7 @@ def _wait_for_poster(task: PosterTask, config: dict[str, str]) -> Path:
     next_notice_at = started_at
     while time.monotonic() < deadline:
         try:
+            image_control.check()
             result = _request_json(
                 session,
                 "POST",
@@ -3384,7 +3414,7 @@ def _wait_for_poster(task: PosterTask, config: dict[str, str]) -> Path:
                 f"{detail}；{delay:.0f}s 后继续查询原任务",
                 flush=True,
             )
-            time.sleep(delay)
+            image_control.wait(delay)
             continue
         except requests.RequestException as exc:
             consecutive_query_failures += 1
@@ -3402,7 +3432,7 @@ def _wait_for_poster(task: PosterTask, config: dict[str, str]) -> Path:
                 f"{delay:.0f}s 后继续查询原任务: {type(exc).__name__}",
                 flush=True,
             )
-            time.sleep(delay)
+            image_control.wait(delay)
             continue
         status = str(_find_first_key(result, {"status", "state", "taskStatus"}) or "").upper()
         file_url = _find_image_url(
@@ -3472,7 +3502,7 @@ def _wait_for_poster(task: PosterTask, config: dict[str, str]) -> Path:
                     flush=True,
                 )
                 next_notice_at = now + 30
-        time.sleep(5)
+        image_control.wait(5)
     raise RunningHubResultRetryableError(
         f"{poster_id} 图像生成查询超时，提交结果尚未确认；将复用原请求身份继续查询",
         confirmed_terminal=False,
@@ -3481,6 +3511,15 @@ def _wait_for_poster(task: PosterTask, config: dict[str, str]) -> Path:
 
 
 def _render_poster_with_retry(
+    macro: dict[str, Any], account_pool: RunningHubAccountPool
+) -> Path:
+    with image_control.scope(cancel_event=macro.get('_cancel_event'),
+                             label=str(macro.get('progress_label') or macro['macro_scene_id'])):
+        image_control.check()
+        return _render_poster_attempts(macro, account_pool)
+
+
+def _render_poster_attempts(
     macro: dict[str, Any], account_pool: RunningHubAccountPool
 ) -> Path:
     """Try another account after 421; queue only when every configured account is busy."""
@@ -3499,14 +3538,16 @@ def _render_poster_with_retry(
         queued = True
     for attempt in range(1, max_attempts + 1):
         try:
+            image_control.check()
             if queued:
                 # Only one queued worker checks a newly-free slot and resubmits at a time.
-                with _QUEUE_RETRY_LOCK:
+                with image_control.locked(_QUEUE_RETRY_LOCK):
                     _wait_for_queue_slot(poster_id, config)
                     task = _submit_poster(working_macro, config)
             else:
                 task = _submit_poster(working_macro, config)
             result = _wait_for_poster(task, config)
+            image_control.check()
             account_pool.mark_available(config)
             if config.get("cloud_pool") == "1":
                 _clear_cloud_retry_state(working_macro)
@@ -3568,7 +3609,7 @@ def _render_poster_with_retry(
                 f"({attempt}/{max_attempts}): {exc}",
                 flush=True,
             )
-            time.sleep(delay)
+            image_control.wait(delay)
         except RunningHubModerationError as exc:
             if moderation_retries >= max_moderation_retries:
                 account_pool.release(config)
@@ -3596,7 +3637,7 @@ def _render_poster_with_retry(
                 f"（{moderation_retries}/{max_moderation_retries}，新请求 retry-{generation}）: {exc}",
                 flush=True,
             )
-            time.sleep(delay)
+            image_control.wait(delay)
         except RunningHubResultRetryableError as exc:
             is_generic_cloud_terminal_failure = (
                 config.get("cloud_pool") == "1"
@@ -3638,7 +3679,7 @@ def _render_poster_with_retry(
                     f"避免重复扣费（{result_retries}/{allowed_result_retries}）: {exc}",
                     flush=True,
                 )
-            time.sleep(delay)
+            image_control.wait(delay)
         except Exception:
             account_pool.release(config)
             raise
@@ -3659,8 +3700,10 @@ def render_posters_concurrently(
         provider_configs,
         per_key_concurrency=active_workers if uses_cloud_pool else None,
     )
+    cancelled = threading.Event()
     mapping = [
-        {**macro, "progress_label": f"{macro['macro_scene_id']} ({index}/{len(mapping)})"}
+        {**macro, "progress_label": f"{macro['macro_scene_id']} ({index}/{len(mapping)})",
+         "_cancel_event": cancelled}
         for index, macro in enumerate(mapping, 1)
     ]
     if uses_cloud_pool:
@@ -3694,9 +3737,17 @@ def render_posters_concurrently(
                 _record_partial_poster_success(mapping, index, completed[index])
                 print(f"[POSTER_PROGRESS] {len(completed)}/{len(mapping)}", flush=True)
             except CloudImageLoginRequired as exc:
+                cancelled.set()
                 for pending in futures:
                     pending.cancel()
                 fatal_error = exc
+                failures[index] = str(exc)
+            except (image_control.ImageWaitTimeout, image_control.ImageWaitStopped) as exc:
+                cancelled.set()
+                for pending in futures:
+                    pending.cancel()
+                if fatal_error is None:
+                    fatal_error = exc
                 failures[index] = str(exc)
             except RunningHubAllAccountsPowerInsufficient as exc:
                 for pending in futures:
@@ -3813,6 +3864,76 @@ window.__timelines=window.__timelines||{{}}; window.__timelines.main={{duration:
     return html_path
 
 
+def _bind_material_references_with_diagnostics(mapping):
+    import copy
+    from backend.app.reference_materials import ReferenceBindingMismatch, explicit_reference_labels, reference_metadata
+    result = []
+    catalog = _reference_image_catalog()
+    for index, original in enumerate(mapping, 1):
+        candidate = copy.deepcopy(original)
+        try:
+            result.extend(_bind_material_references_once([candidate]))
+            continue
+        except ReferenceBindingMismatch as exc:
+            problem = str(exc)
+        # Only repair a selection mismatch involving known materials. Do not
+        # turn missing assets, provider failures or arbitrary validation into retries.
+        selected = list(candidate.get('reference_image_ids') or [])
+        required = set(selected) | explicit_reference_labels(candidate.get('image_prompt', ''))
+        if any(label not in catalog for label in required) or len(required) > 3:
+            raise ValueError(f'第{index}镜（{candidate.get("macro_scene_id", "?")}）：{problem}')
+        for attempt in range(1, 3):
+            print(f'第{index}镜（{candidate.get("macro_scene_id", "?")}）参考绑定不一致，Agent 2 定点修复 {attempt}/2；尚未提交出图。', flush=True)
+            # The immutable prompt and timeline remain authoritative. This
+            # repair only fills the attachment list, never rewrites the scene.
+            response = generate_gemini_text(
+                system_prompt='你是 Agent 2 的参考素材绑定修复员。只修复当前镜头的附件选择，不重新规划画面。'
+                    '保留已经选择的素材，补齐提示词明确引用的素材，不添加无关素材。'
+                    '返回 JSON 对象 {"reference_image_ids":["图1"]}，只能使用提供的图号，最多3张。',
+                user_prompt=json.dumps({'error': problem, 'shot': {
+                    'macro_scene_id': candidate.get('macro_scene_id'), 'image_prompt': candidate.get('image_prompt'),
+                    'reference_image_ids': selected}, 'available_references': [
+                    {'label': label, 'description': next((r.get('description', '') for r in reference_metadata() if r.get('label') == label), '')}
+                    for label in catalog]}, ensure_ascii=False),
+                temperature=0.1, response_mime_type='application/json', max_output_tokens=1000, json_root='object')
+            try:
+                payload = parse_json_response(response)
+                ids = payload.get('reference_image_ids') if isinstance(payload, dict) else None
+                if (not isinstance(ids, list) or any(not isinstance(v, str) for v in ids)
+                        or len(ids) > 3 or len(set(ids)) != len(ids) or set(ids) != required):
+                    raise ValueError('修复结果必须只包含原已选素材及提示词明确引用的现有素材')
+                candidate['reference_image_ids'] = ids
+                result.extend(_bind_material_references_once([candidate]))
+                print(f'第{index}镜参考绑定修复通过，继续后续流程。', flush=True)
+                break
+            except ValueError as exc:
+                problem = str(exc)
+                if attempt == 2:
+                    raise ValueError(f'第{index}镜（{candidate.get("macro_scene_id", "?")}）参考绑定自动修复2次仍失败：{problem}；原规划和失败现场已保留') from exc
+    return result
+
+
+def _bind_material_references_once(mapping):
+    from backend.app.reference_materials import bind_material_references
+    catalog = _reference_image_catalog()
+    try:
+        return bind_material_references(mapping, catalog)
+    except ValueError as exc:
+        # Preserve the exact failed candidates before later runs overwrite the
+        # shared successful mapping. Never archive API credentials or media.
+        folder = (_visual_checkpoint_dir() or VISUAL_DIR) / 'failures'
+        folder.mkdir(parents=True, exist_ok=True)
+        destination = folder / f'reference_binding_{time.time_ns()}.json'
+        destination.write_text(json.dumps({'error': str(exc), 'available_labels': list(catalog),
+            'mapping': [{'macro_scene_id': row.get('macro_scene_id'),
+                         'includes_slides': row.get('includes_slides'),
+                         'image_prompt': row.get('image_prompt'),
+                         'reference_image_ids': row.get('reference_image_ids', [])}
+                        for row in mapping]}, ensure_ascii=False, indent=2), encoding='utf-8')
+        print(f'参考素材绑定失败现场已保留：{destination}', flush=True)
+        raise
+
+
 def run_online_poster_engine() -> None:
     print("[模块 4] 在线海报与页面生成启动", flush=True)
     if not TIMELINE_PATH.is_file():
@@ -3863,12 +3984,16 @@ def run_online_poster_engine() -> None:
             ):
                 raise ValueError("断点续跑发现字幕场景已变化，旧海报规划与当前文案不匹配，已停止以防错图")
             prompt_agent_is_current = (
+                # The same scene timing is not sufficient: the story/context
+                # that produced the cached images must match as well.
                 isinstance(previous_plan, dict)
                 and int(previous_plan.get("agent_version") or 0) >= VISUAL_PROMPT_AGENT_VERSION
                 and int(previous_plan.get("story_agent_version") or 0) >= int(story_plan.get("agent_version") or 0)
                 and int(previous_plan.get("character_continuity_version") or 0)
                 >= int(story_plan.get("character_continuity_version") or 0)
             )
+            if previous_plan.get('story_source_fingerprint') != story_plan.get('source_fingerprint'):
+                raise ValueError('断点续跑发现故事规划来源与旧海报不一致，已停止以防混用其他文案；原素材保留，请核对后重新规划画面')
             if not prompt_agent_is_current:
                 reuse_existing_mapping = False
                 print("断点续跑：检测到旧版人物连续性规划，将重新生成提示词并只重画受影响图片。", flush=True)
@@ -3894,7 +4019,7 @@ def run_online_poster_engine() -> None:
                 draft_temp.write_text(json.dumps({"key": draft_key, "mapping": mapping}, ensure_ascii=False), encoding="utf-8")
                 draft_temp.replace(draft_path)
             from backend.app.reference_materials import bind_material_references
-            mapping = bind_material_references(mapping, _reference_image_catalog())
+            mapping = _bind_material_references_with_diagnostics(mapping)
             from scene_reference_coordinator import plan_scene_references, bind_scene_references
             scene_cache = VISUAL_DIR / "scene_reference_plan.json"
             from backend.app.reference_materials import reference_metadata
@@ -3925,7 +4050,7 @@ def run_online_poster_engine() -> None:
                 mapping = bind_scene_references(mapping, scene_plan, reference_paths, _reference_image_catalog())
         else:
             from backend.app.reference_materials import bind_material_references
-            mapping = bind_material_references(mapping, _reference_image_catalog())
+            mapping = _bind_material_references_with_diagnostics(mapping)
         backup_poster_mapping()
         POSTER_MAPPING_PATH.write_text(
             json.dumps(mapping, ensure_ascii=False, indent=2),
@@ -3986,7 +4111,7 @@ def _reference_image_url(config: dict[str, str], raw_path: str | None = None) ->
     if not raw_path or not path.is_file():
         return None
     cache_key = (config["api_key"], config.get("method", "running"), config.get("upload_url", ""), str(path.resolve()))
-    with _REFERENCE_UPLOAD_LOCK:
+    with image_control.locked(_REFERENCE_UPLOAD_LOCK):
         cached = _REFERENCE_IMAGE_URLS.get(cache_key)
         if cached:
             return cached
@@ -4011,7 +4136,7 @@ def _reference_image_url(config: dict[str, str], raw_path: str | None = None) ->
                     timeout=120,
                 )
             payload = response.json()
-        except CloudImageLoginRequired:
+        except (CloudImageLoginRequired, image_control.ImageWaitStopped, image_control.ImageWaitTimeout):
             raise
         except (OSError, requests.RequestException, ValueError, RuntimeError) as exc:
             # The cloud proxy currently returns HTTP 500 for some valid image

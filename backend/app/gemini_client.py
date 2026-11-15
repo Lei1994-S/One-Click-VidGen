@@ -6,6 +6,8 @@ import json
 import os
 import re
 import time
+import threading
+import queue
 from collections import ChainMap
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -18,6 +20,21 @@ from .config import load_project_env
 load_project_env()
 
 _LANGUAGE_ENV = ContextVar('ocv_language_environment', default=None)
+_SINGLE_ATTEMPT = ContextVar('ocv_language_single_attempt', default=False)
+
+
+@contextmanager
+def single_model_attempt():
+    """Bound this explicitly priced action to its configured model and one POST.
+
+    Context-local so a preview never alters retry or fallback policy of a
+    concurrently running planning or TTS task.
+    """
+    token = _SINGLE_ATTEMPT.set(True)
+    try:
+        yield
+    finally:
+        _SINGLE_ATTEMPT.reset(token)
 
 
 @contextmanager
@@ -448,6 +465,8 @@ def language_provider_status() -> dict[str, Any]:
 def _gemini_models(provider: str | None = None) -> list[str]:
     config = language_provider_config(provider)
     primary = language_model(provider)
+    if _SINGLE_ATTEMPT.get():
+        return [primary]
     fallback_raw = _language_getenv("GEMINI_FALLBACK_MODELS", "").strip()
     models = [primary]
     if fallback_raw and (provider or _provider()) in {"gemini", "runninghub"}:
@@ -461,6 +480,8 @@ def _gemini_models(provider: str | None = None) -> list[str]:
 
 
 def _gemini_retry_count() -> int:
+    if _SINGLE_ATTEMPT.get():
+        return 1
     raw_value = os.getenv("GEMINI_RETRY_COUNT", "3").strip()
     try:
         return max(1, int(raw_value))
@@ -486,7 +507,7 @@ def _gemini_timeout() -> tuple[float, float]:
         read = max(connect, float(os.getenv("GEMINI_READ_TIMEOUT_SECONDS", "120")))
     except ValueError:
         read = 120.0
-    return connect, read
+    return (min(connect, 8.0), min(read, 75.0)) if _SINGLE_ATTEMPT.get() else (connect, read)
 
 
 def _extract_error_message(response: requests.Response) -> str:
@@ -503,6 +524,39 @@ def _extract_error_message(response: requests.Response) -> str:
             return str(message)
     message = data.get("message") or data.get("errorMessage")
     return str(message) if message else str(data)[:300]
+
+
+def _reasoning_post(url, *, seconds, **kwargs):
+    """Bound local wall-clock waiting, including a slowly delivered response."""
+    result = queue.Queue(maxsize=1)
+    expired = threading.Event()
+    def work():
+        try:
+            response = requests.post(url, timeout=(min(15, seconds), seconds), **kwargs)
+            if expired.is_set():
+                response.close()
+            else:
+                result.put((response, None))
+        except Exception as exc:
+            if not expired.is_set(): result.put((None, exc))
+    threading.Thread(target=work, daemon=True).start()
+    try:
+        response, error = result.get(timeout=seconds)
+    except queue.Empty:
+        expired.set()
+        raise GeminiError(f'模型单次回复超过 {seconds:g} 秒等待上限（包含思考与正文）；未自动重试、未切换渠道。上游可能仍在执行或计费，请核对后手动重试。') from None
+    if error: raise GeminiError(f'思考模型请求中断：{type(error).__name__}；未自动重试、未切换渠道') from error
+    return response
+
+
+def _conclusion_only(text):
+    # Only remove an explicit leading reasoning block; never guess prose bounds.
+    text = text.strip()
+    while text.startswith('<think>'):
+        end = text.find('</think>')
+        if end < 0: raise GeminiError('模型仅返回未完成的思考内容，未收到结论正文；未自动重试')
+        text = text[end + len('</think>'):].strip()
+    return text
 
 
 def _generate_openai_compatible_text(
@@ -566,6 +620,7 @@ def _generate_openai_compatible_text(
         elif extra_body:
             payload["extra_body"] = extra_body
 
+        compatibility = provider == 'custom' and os.getenv('CUSTOM_LLM_REASONING_COMPAT', '1') == '1'
         url = f"{base_url}/chat/completions"
         response = None
         for attempt in range(1, _gemini_retry_count() + 1):
@@ -573,6 +628,12 @@ def _generate_openai_compatible_text(
                 headers = {"Content-Type": "application/json"}
                 if api_key:
                     headers["Authorization"] = f"Bearer {api_key}"
+                if compatibility:
+                    response = _reasoning_post(url, seconds=max(10,min(600,float(os.getenv('CUSTOM_LLM_REPLY_TIMEOUT','120')))), headers=headers, json=payload)
+                    # Never replay a potentially billed request or try another model.
+                    if not response.ok:
+                        raise GeminiError(f"{config['label']} HTTP {response.status_code}；未自动重试、未切换渠道")
+                    break
                 response = requests.post(
                     url,
                     headers=headers,
@@ -622,8 +683,10 @@ def _generate_openai_compatible_text(
             f"{config['label']} 输出被长度上限截断（max_tokens={payload['max_tokens']}，usage={usage}）"
         )
     text = str(message.get("content") or "").strip() if isinstance(message, dict) else ""
+    if compatibility:
+        text = _conclusion_only(text)
     if not text:
-        raise GeminiError(f"{config['label']} 返回为空: {data}")
+        raise GeminiError(f"{config['label']} 未返回结论正文（可能只有思考内容）；未将思考链交给下游")
     return text
 
 

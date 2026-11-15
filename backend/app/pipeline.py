@@ -275,6 +275,7 @@ class Job:
             "progress": self.progress,
             "message": self.message,
             "created_at": self.created_at,
+            "run_id": self.request.get('_run_generation') or f'legacy:{self.id}:{self.created_at}',
             "updated_at": self.updated_at,
             "logs": self.logs[-250:],
             "artifacts": self.artifacts,
@@ -553,6 +554,8 @@ class JobStore:
         """Queue a pipeline run and execute jobs serially against the shared workspace."""
         with self._lock:
             previous = self._pending_runs.get(job.id)
+            if previous is None:
+                job.request['_run_generation'] = uuid.uuid4().hex
             self._pending_runs[job.id] = (
                 resume or bool(previous and previous[0]),
                 priority or bool(previous and previous[1]),
@@ -755,8 +758,10 @@ class JobStore:
             if self._processes.get(job.id) is process:
                 self._processes.pop(job.id, None)
 
-    def cancel(self, job: Job) -> dict[str, Any]:
+    def cancel(self, job: Job, *, expected_run_id: str | None = None) -> dict[str, Any]:
         with self._lock:
+            if expected_run_id is not None and job.snapshot()['run_id'] != expected_run_id:
+                raise ValueError('任务已重新启动，停止请求对应旧任务；请刷新后重试')
             if job.status in TERMINAL_JOB_STATUSES:
                 return job.snapshot()
             event = self._cancel_events.setdefault(job.id, threading.Event())
@@ -1379,7 +1384,10 @@ def write_original_text_from_asr(job: Job) -> None:
 
 
 def canonical_story_text(request: dict[str, Any], scenes: list[dict[str, Any]]) -> str:
-    """Agent 0 reads author text when supplied, otherwise corrected ASR text."""
+    """After narration review, all modes use the sealed recorded copy."""
+    if (request.get('_final_narration_fingerprint') and request.get('_final_narration_script')
+            and re.sub(r'\s+', '', str(request.get('script') or '')) == re.sub(r'\s+', '', str(request['_final_narration_script']))):
+        return str(request['_final_narration_script'])
     authored = parse_structural_blanks(str(request.get("script") or "")).clean_text
     if authored:
         return authored
@@ -2417,7 +2425,7 @@ def render_semantic_visual_video(
         store.log(job, f"HTML 模板写入: {html_path}")
         store.log(job, f"视觉生成来源: {provider}")
     elif visual_backend in {"poster", "online-poster", "runninghub"}:
-        poster_env = {"VOICE_OVER_VIDEO_JOB_ID": job.id, "USER_REFERENCE_IMAGE_PATHS_JSON": "[]", "USER_REFERENCE_IMAGE_METADATA_JSON": "[]", "USER_PROTAGONIST_REFERENCE_IMAGE_PATH": ""}
+        poster_env = {"USE_CLOUD_IMAGE_POOL": "0", "VOICE_OVER_VIDEO_JOB_ID": job.id, "USER_REFERENCE_IMAGE_PATHS_JSON": "[]", "USER_REFERENCE_IMAGE_METADATA_JSON": "[]", "USER_PROTAGONIST_REFERENCE_IMAGE_PATH": ""}
         cloud_pool_client = None
         cloud_session_update_path = None
         if bool(request.get("use_cloud_image_pool")):
@@ -2445,7 +2453,7 @@ def render_semantic_visual_video(
                 "GEMINI_MODEL": "auto",
                 "GEMINI_FALLBACK_MODELS": "",
             })
-            store.log(job, "模块 4：Agent 2 与出图均使用云端号池，费用由云端账户积分结算")
+            store.log(job, "模块 4：出图使用云端图像号池，语言模型沿用本项目规划渠道")
         elif isinstance(request.get("image_profile_snapshot"), dict):
             from .image_profiles import profile_environment
             image_snapshot = dict(request["image_profile_snapshot"])
@@ -2459,6 +2467,18 @@ def render_semantic_visual_video(
                     str(image_snapshot.get("resolution") or "1k").upper(),
                 ),
             )
+        from .language_routing import uses_cloud_language
+        language_keys = ('LANGUAGE_PROVIDER', 'GEMINI_API_KEY', 'GEMINI_API_BASE', 'GEMINI_MODEL', 'GEMINI_FALLBACK_MODELS')
+        if not uses_cloud_language(request):
+            for key in language_keys:
+                poster_env.pop(key, None)
+        elif not request.get('use_cloud_image_pool'):
+            runtime = cloud_client_for(int(job.user_id)).image_pool_runtime()
+            poster_env.update({
+                'LANGUAGE_PROVIDER': 'gemini', 'GEMINI_API_KEY': runtime['access_token'],
+                'GEMINI_API_BASE': runtime['base_url'].rstrip('/') + '/model-pool/v1',
+                'GEMINI_MODEL': 'auto', 'GEMINI_FALLBACK_MODELS': '',
+            })
         # Agent 2 is a paid-image safety gate. Never submit image jobs when its
         # language-model planning failed or silently fell back to raw subtitles.
         poster_env["REQUIRE_AI_AGENT_SUCCESS"] = "1"
@@ -2594,12 +2614,24 @@ def render_semantic_visual_video(
     )
 
 
+def _replace_file_with_retry(pending: Path, target: Path) -> None:
+    """Bounded retry for transient Windows file-reader/antivirus handles."""
+    for attempt in range(4):
+        try:
+            os.replace(pending, target)
+            return
+        except PermissionError:
+            if attempt == 3:
+                raise
+            time.sleep(.05 * (attempt + 1))
+
+
 def _copy_file_atomic(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     pending = target.with_name(f".{target.name}.{uuid.uuid4().hex}.pending")
     try:
         shutil.copy2(source, pending)
-        os.replace(pending, target)
+        _replace_file_with_retry(pending, target)
     finally:
         pending.unlink(missing_ok=True)
 
@@ -3429,6 +3461,7 @@ def _archive_uploaded_audio_segments(
     pending = segment_archive.with_name(f".{segment_archive.name}.{uuid.uuid4().hex}.tmp")
     shutil.rmtree(pending, ignore_errors=True)
     pending.mkdir(parents=True, exist_ok=True)
+    published = False
     try:
         with wave.open(str(audio_path), "rb") as source:
             params = source.getparams()
@@ -3477,11 +3510,18 @@ def _archive_uploaded_audio_segments(
         (pending / "manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        if segment_archive.exists():
-            shutil.rmtree(segment_archive)
-        os.replace(pending, segment_archive)
+        # Windows readers/AV may hold a directory handle. Publish individual
+        # files with rollback, manifest last; never remove the old directory.
+        _sync_segment_archive_files(pending, segment_archive)
+        published = True
+    except Exception as exc:
+        if (pending / 'manifest.json').is_file():
+            raise RuntimeError(f'上传配音分段保存失败，原始配音未改动；候选分段保留在 {pending}。'
+                               f'请关闭占用文件后恢复任务：{type(exc).__name__}: {exc}') from exc
+        raise
     finally:
-        shutil.rmtree(pending, ignore_errors=True)
+        if published or not (pending / 'manifest.json').is_file():
+            shutil.rmtree(pending, ignore_errors=True)
     return segment_archive
 
 
@@ -3576,7 +3616,15 @@ def _segment_archives_match(source: Path, target: Path) -> bool:
     return True
 
 
+_ARCHIVE_COMMIT_LOCK = threading.RLock()
+
+
 def _sync_segment_archive_files(source: Path, target: Path) -> None:
+    with _ARCHIVE_COMMIT_LOCK:
+        _sync_segment_archive_files_locked(source, target)
+
+
+def _sync_segment_archive_files_locked(source: Path, target: Path) -> None:
     """Publish files without renaming a directory Windows readers may still hold.
 
     Keep a rollback copy and publish the manifest last. The checkpoint revision
@@ -3588,21 +3636,28 @@ def _sync_segment_archive_files(source: Path, target: Path) -> None:
     files = sorted((p for p in source.rglob("*") if p.is_file()),
                    key=lambda p: (p.name == "manifest.json", str(p)))
     published = []
+    keep_backup = False
     try:
         for path in files:
             relative = path.relative_to(source)
             _copy_file_atomic(path, target / relative)
             published.append(relative)
-    except Exception:
-        for relative in reversed(published):
-            old = backup / relative
-            if old.is_file():
-                _copy_file_atomic(old, target / relative)
-            else:
-                (target / relative).unlink(missing_ok=True)
+    except Exception as original:
+        try:
+            for relative in reversed(published):
+                old = backup / relative
+                if old.is_file():
+                    _copy_file_atomic(old, target / relative)
+                else:
+                    (target / relative).unlink(missing_ok=True)
+        except Exception as rollback:
+            keep_backup = True
+            raise RuntimeError(f'配音分段提交及回滚受阻；请勿删除恢复备份 {backup}；'
+                               f'提交错误：{original}；回滚错误：{rollback}') from original
         raise
     finally:
-        shutil.rmtree(backup, ignore_errors=True)
+        if not keep_backup:
+            shutil.rmtree(backup, ignore_errors=True)
 
 
 def sync_refined_step_audio_assets(job: Job, project_dir: Path) -> dict[str, Any]:
@@ -3859,6 +3914,8 @@ def organize_project_output(job: Job, request: dict[str, Any]) -> Path:
                 if not source.is_file() or source.stat().st_size <= 0:
                     raise FileNotFoundError(f"分步渲染完成后缺少{key}成片")
                 _copy_file_atomic(source, target)
+                from .video_bookends import apply_bookends
+                apply_bookends(target, job.user_id, request)
             else:
                 target.unlink(missing_ok=True)
         (other_dir / "任务参数.json").write_text(
@@ -4008,6 +4065,8 @@ def organize_project_output(job: Job, request: dict[str, Any]) -> Path:
         for source, target in video_copies.items():
             if source.is_file():
                 shutil.copy2(source, target)
+                from .video_bookends import apply_bookends
+                apply_bookends(target, job.user_id, request)
 
         final_srt = WORKSPACE_DIR / "2_audio_srt" / "final_short.srt"
         output_srt = other_dir / "最终字幕.srt"
@@ -4601,6 +4660,12 @@ def finalize_completed_pipeline(job: Job, store: JobStore, request: dict[str, An
     store.raise_if_cancelled(job)
     store.log(job, f"项目输出已整理: {output_dir}")
     artifacts = copy_artifacts(job)
+    if request.get('intro_video_id') or request.get('outro_video_id'):
+        for filename, artifact_name in [('最终视频_字幕版.mp4', 'final_with_subtitles.mp4'),
+                                        ('最终视频_纯净版.mp4', 'final_raw_presentation.mp4')]:
+            source = output_dir / 'video' / filename
+            if source.is_file():
+                shutil.copy2(source, JOBS_DIR / job.id / 'artifacts' / artifact_name)
     store.raise_if_cancelled(job)
     store.update(
         job,

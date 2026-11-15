@@ -1,6 +1,7 @@
-"""Authenticated, free-test H3 queue. GPU execution belongs to a separate worker.
+"""Authenticated, metered H3 queue. GPU execution belongs to a separate worker.
 
-No wallet mutation, remote URL fetch, or caller-supplied ComfyUI graph is allowed.
+Quotes freeze the price; job submission reserves credits and terminal states settle them.
+No remote URL fetch or caller-supplied ComfyUI graph is allowed.
 Enable explicitly with CLOUD_VIDEO_ENABLED=1; optionally restrict account IDs with
 CLOUD_VIDEO_TEST_USER_IDS (comma-separated). Storage must not be served statically.
 """
@@ -30,13 +31,15 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 from .deps import CurrentUser, Db
 from .models import User
+from . import h3_billing
 
 router = APIRouter(prefix="/api/v1/cloud/video", tags=["cloud-video-test"])
 MODEL = "minimax-h3"
 REVISION = "h3-fast-linux-v1"
-RESOLUTIONS = ((640, 384), (384, 640), (512, 512), (1280, 720), (720, 1280), (2048, 1152), (1152, 2048))
-DEFAULT_RESOLUTIONS = {"landscape": {"width": 2048, "height": 1152},
-                       "portrait": {"width": 1152, "height": 2048}}
+MAX_VIDEO_PIXELS = 1664 * 936
+RESOLUTIONS = ((1664, 936), (936, 1664), (1536, 864), (864, 1536), (1280, 720), (720, 1280), (512, 512), (640, 384), (384, 640))
+DEFAULT_RESOLUTIONS = {"landscape": {"width": 1664, "height": 936},
+                       "portrait": {"width": 936, "height": 1664}}
 TERMINAL = {"succeeded", "failed", "cancelled"}
 MAX_UPLOAD = 20 * 1024 * 1024
 MAX_PIXELS = 16_000_000
@@ -149,7 +152,7 @@ class VideoSpec(BaseModel):
     reference_image_asset_id: str = Field(pattern=r"^h3asset_[0-9a-f]{32}$")
     width: int
     height: int
-    duration_seconds: float = Field(ge=2, le=10, allow_inf_nan=False)
+    duration_seconds: float = Field(gt=0, le=14, allow_inf_nan=False)
     seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
 
 
@@ -165,6 +168,8 @@ class JobRequest(BaseModel):
 
 
 def normalize_spec(spec):
+    if spec.width <= 0 or spec.height <= 0 or spec.width * spec.height > MAX_VIDEO_PIXELS:
+        raise HTTPException(422, "H3 output exceeds the 1664 x 936 total-pixel limit")
     if (spec.width, spec.height) not in RESOLUTIONS:
         raise HTTPException(422, "Unsupported H3 resolution")
     prompt = spec.prompt.strip()
@@ -186,20 +191,47 @@ def owned_job(db, user, job_id, lock=False):
 
 
 def snapshot(job):
+    stage, message = {
+        'queued': ('queued', '云端排队中，尚未派发到 GPU 节点'),
+        'running': ('dispatching', '正在派发到 GPU 节点，尚未确认视频引擎接收'),
+        'cancelling': ('cancelling', '正在停止原任务，请勿重复提交'),
+        'succeeded': ('completed', '视频已生成，等待客户端下载'),
+        'failed': ('failed', job.error_message or '视频生成失败，请查看错误详情'),
+        'cancelled': ('cancelled', '视频任务已取消'),
+    }.get(job.status, (job.status, '正在核对云端任务状态'))
+    if job.status == 'running' and job.remote_prompt_id:
+        stage, message = 'node_processing', 'GPU 节点已接收，正在加载模型或生成视频'
+    if job.status == 'running' and job.heartbeat_at and (utcnow() - aware(job.heartbeat_at)).total_seconds() > 90:
+        stage, message = 'reconnecting', '执行状态暂未更新，正在核对节点连接；请勿重复提交'
     return {"job_id": job.id, "client_job_id": job.client_job_id, "status": job.status,
-            "spec": job.spec, "progress": job.progress, "credits": "0", "test_mode": True,
+            "stage": stage, "message": message,
+            "spec": job.spec, "progress": job.progress, "credits": h3_billing.frozen(job.spec)["credits"],
+            "test_mode": not bool(job.spec.get("_billing")), "pricing": h3_billing.frozen(job.spec),
             "error": {"code": job.error_code, "message": job.error_message} if job.error_code else None,
             "result_url": f"/api/v1/cloud/video/jobs/{job.id}/result" if job.status == "succeeded" else None,
             "timings": job.timings, "created_at": job.created_at, "started_at": job.started_at,
             "finished_at": job.finished_at}
 
 
+@router.get("/pricing")
+def public_pricing():
+    """Public price information; never expose account or node configuration."""
+    from fastapi.responses import JSONResponse
+    rates = h3_billing.pricing()
+    return JSONResponse({"model": MODEL, "pricing": rates,
+                         "examples": [{"seconds": seconds, "credits": h3_billing.price(seconds, rates=rates)["credits"]}
+                                      for seconds in (10, 12, 14)]},
+                        headers={"Cache-Control": "no-store"})
+
+
 @router.get("/capabilities")
 def capabilities(user: CurrentUser):
-    return {"enabled": feature_enabled(user), "test_mode": True, "credits": "0", "model": MODEL,
+    return {"enabled": feature_enabled(user), "test_mode": False, "pricing": h3_billing.pricing(), "model": MODEL,
             "workflow_revision": REVISION, "fps": 24, "resolutions": [{"width": w, "height": h} for w, h in RESOLUTIONS],
             "default_resolutions": DEFAULT_RESOLUTIONS,
-            "duration_seconds": {"min": 2, "max": 10}, "audio_supported": False,
+            "max_output_pixels": MAX_VIDEO_PIXELS,
+            "duration_seconds": {"min": 2, "max": 14}, "duration_policy": "server",
+            "duration_limit_enforced": True, "audio_supported": False,
             "max_upload_bytes": MAX_UPLOAD, "frame_divisor": 17, "frame_remainder": 5,
             "frame_rule": {"divisor": 17, "remainder": 5}}
 
@@ -257,13 +289,15 @@ async def upload_asset(db: Db, user: CurrentUser, kind: Literal["image"] = Form(
 def quote(body: QuoteRequest, db: Db, user: CurrentUser):
     require_enabled(user)
     spec = normalize_spec(body.spec)
+    spec["_billing"] = h3_billing.price(spec["duration_seconds"])
     asset = db.scalar(select(CloudVideoAsset).where(CloudVideoAsset.id == spec["reference_image_asset_id"], CloudVideoAsset.user_id == user.id))
     if asset is None or aware(asset.expires_at) <= utcnow() or not storage_path(asset.storage_key).is_file():
         raise HTTPException(404, "Reference image not found or expired")
     record = CloudVideoQuote(id=identifier("h3quote"), user_id=user.id, spec=spec, expires_at=utcnow() + timedelta(minutes=15))
     db.add(record)
     db.commit()
-    return {"quote_id": record.id, "spec": record.spec, "credits": "0", "test_mode": True, "expires_at": record.expires_at}
+    return {"quote_id": record.id, "spec": record.spec, "credits": h3_billing.frozen(record.spec)["credits"], "test_mode": False,
+            "pricing": h3_billing.frozen(record.spec), "expires_at": record.expires_at}
 
 
 @router.post("/jobs", status_code=201)
@@ -286,6 +320,8 @@ def create_job(body: JobRequest, db: Db, user: CurrentUser):
         return snapshot(existing)
     if aware(record.expires_at) <= utcnow():
         raise HTTPException(409, "Quote expired; request a new quote")
+    if record.spec['width'] * record.spec['height'] > MAX_VIDEO_PIXELS:
+        raise HTTPException(422, "H3 output exceeds the 1664 x 936 total-pixel limit; request a new quote")
     asset = db.get(CloudVideoAsset, record.spec["reference_image_asset_id"])
     if asset is None or asset.user_id != user.id or not storage_path(asset.storage_key).is_file():
         raise HTTPException(404, "Reference image unavailable")
@@ -294,6 +330,7 @@ def create_job(body: JobRequest, db: Db, user: CurrentUser):
         raise HTTPException(429, "Too many pending H3 test jobs")
     job = CloudVideoJob(id=identifier("h3job"), user_id=user.id, quote_id=record.id, client_job_id=client_id, spec=dict(record.spec), status="queued")
     db.add(job)
+    h3_billing.reserve(db, job)
     try:
         db.commit()
     except IntegrityError:
@@ -322,6 +359,7 @@ def cancel_job(job_id: str, db: Db, user: CurrentUser):
         job.status, job.finished_at = "cancelled", utcnow()
     elif job.status == "running":
         job.status = "cancelling"
+    h3_billing.settle(db, job)
     db.commit()
     return snapshot(job)
 

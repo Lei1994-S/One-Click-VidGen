@@ -250,6 +250,10 @@ def apply_wallet_entry(
     idempotency_key: str,
     note: str | None = None,
 ) -> WalletLedger:
+    from .bonus_credits import expire_available, reserve_bonus, settle_bonus_reservation
+
+    now = utcnow()
+    expire_available(db, wallet, now=now)
     existing = db.scalar(
         select(WalletLedger).where(
             WalletLedger.idempotency_key == idempotency_key
@@ -257,6 +261,27 @@ def apply_wallet_entry(
     )
     if existing:
         return existing
+    if entry_type.startswith("reserve") and available_delta < 0:
+        reserve_bonus(
+            db, wallet, amount=min(-Decimal(str(available_delta)), wallet.available),
+            reference_type=reference_type, reference_id=reference_id, now=now,
+        )
+    if entry_type.startswith("consume") and reserved_delta < 0:
+        settle_bonus_reservation(
+            db, wallet, amount=-Decimal(str(reserved_delta)),
+            reference_type=reference_type, reference_id=reference_id,
+            consume=True, now=now,
+        )
+    if entry_type.startswith("release") and reserved_delta < 0:
+        settled, refunded_bonus = settle_bonus_reservation(
+            db, wallet, amount=-Decimal(str(reserved_delta)),
+            reference_type=reference_type, reference_id=reference_id,
+            consume=False, now=now,
+        )
+        # Expired promotional reservations are dropped; purchased credits and
+        # unexpired promotional reservations return to the available balance.
+        purchased_refund = max(Decimal("0"), -Decimal(str(reserved_delta)) - settled)
+        available_delta = purchased_refund + refunded_bonus
     next_available = wallet.available + available_delta
     next_reserved = wallet.reserved + reserved_delta
     next_consumed = wallet.consumed + consumed_delta
@@ -501,7 +526,7 @@ def create_video_job(
         raise ServiceError("VIDEO_QUEUE_LIMIT", "视频任务队列已达上限", 429)
 
     quote = video_job_quote(request_json)
-    if request_json["video"].get("method") == "ican":
+    if request_json["video"].get("method") in (None, "running", "runninghub", "ican"):
         request_json = {**request_json, "image_billing_credits": str(
             quote["breakdown"]["images"] / int(request_json["video"]["scene_count"]))}
     job = VideoJob(
@@ -815,13 +840,17 @@ def model_pool_reserve_credits(prompt_tokens: int, completion_tokens: int) -> De
 
 
 def image_pool_reserve_credits() -> Decimal:
-    return usd_to_credits(
-        settings.image_pool_max_upstream_cost_usd,
-        markup_percent=settings.image_pool_markup_percent,
-    )
+    # Fixed retail price; one wallet credit is one CNY.
+    return settings.runninghub_image_price_cny.quantize(CREDIT_QUANTUM, rounding=ROUND_CEILING)
 
 
-def image_pool_actual_credits(actual_cost_credits: str | int | Decimal | None) -> Decimal:
+def image_pool_actual_credits(actual_cost_credits: str | int | Decimal | None, *, fixed_credits=None) -> Decimal:
+    if fixed_credits is not None:
+        price = Decimal(str(fixed_credits))
+        if not price.is_finite() or price <= 0:
+            raise ValueError("fixed image price must be finite and positive")
+        return price.quantize(CREDIT_QUANTUM, rounding=ROUND_CEILING)
+    # Jobs submitted before fixed pricing retain their original cost-plus rule.
     if actual_cost_credits is None:
         return usd_to_credits(
             settings.image_pool_default_upstream_cost_usd,

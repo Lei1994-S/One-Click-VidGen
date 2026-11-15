@@ -7,6 +7,11 @@ import json
 import zipfile
 from pathlib import Path
 
+if __package__:
+    from .release_integrity import unmanaged_rmbg_file, restricted_optional_file
+else:
+    from release_integrity import unmanaged_rmbg_file, restricted_optional_file
+
 
 ROOT_EXCLUDES = {
     ".agents",
@@ -29,6 +34,21 @@ ROOT_EXCLUDES = {
 
 def is_excluded(relative: Path, *, without_local_tts: bool = False, without_local_video: bool = False, without_models: bool = False) -> bool:
     parts = relative.parts
+    if restricted_optional_file(relative.as_posix()):
+        return True
+    # Include the independent RMBG worker/vendor/setup sources in *every*
+    # edition. Its optional weights and locally provisioned interpreter are
+    # never application files; in particular they are not an ordinary upgrade.
+    lower = tuple(p.lower() for p in parts)
+    if unmanaged_rmbg_file(relative.as_posix()) or lower[:2] in {
+        ("runtime", "rmbg"), ("runtime", "vibe_ocr"),
+    }:
+        return True
+    if parts[:3] in {
+        ("tools", "vibe_remotion", ".cache"),
+        ("tools", "vibe_shotcraft_library", ".downloads"),
+    }:
+        return True
     if parts and (parts[0].startswith('local_integration_bundle_') or parts[0] == 'optional_packages'):
         return True
     if without_local_video and parts[:1] == ('comfyui',):
@@ -38,7 +58,10 @@ def is_excluded(relative: Path, *, without_local_tts: bool = False, without_loca
     if parts[:1] == ('comfyui_plugins',):
         return relative.as_posix() not in {'comfyui_plugins/.gitignore', 'comfyui_plugins/README.md'}
     if parts[:2] == ('plugins', 'codex_bridge'):
-        public = {'plugin.json', 'ocv_bridge.py', 'README.md',
+        public = {'plugin.json', 'ocv_bridge.py', 'README.md', 'README_MCP.md', 'AI_GUIDE.md',
+                  'mcp_server.py', 'mcp-requirements.txt',
+                  'ocv_mcp/__init__.py', 'ocv_mcp/adapter.py', 'ocv_mcp/catalog.py',
+                  'ocv_mcp/contracts.py', 'ocv_mcp/guidance.py', 'ocv_mcp/server.py', 'ocv_mcp/state.py',
                   'skills/ocv-production-bridge/SKILL.md',
                   'skills/ocv-production-bridge/agents/openai.yaml'}
         return Path(*parts[2:]).as_posix() not in public

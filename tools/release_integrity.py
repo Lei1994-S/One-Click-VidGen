@@ -14,7 +14,39 @@ import re
 from pathlib import Path
 
 
+# This tight application payload is intentionally independent of the local
+# editable/installed weights and Python environment.
+RMBG_MANAGED_FILES = (
+    "tools/rmbg/README.md",
+    "tools/rmbg/worker.py",
+    "tools/rmbg/setup_runtime.py",
+    "tools/rmbg/runtime-spec.json",
+    "tools/rmbg/vendor/birefnet/birefnet.py",
+    "tools/rmbg/vendor/birefnet/BiRefNet_config.py",
+    "tools/rmbg/vendor/birefnet/config.json",
+    "tools/rmbg/vendor/birefnet/LICENSE",
+    "tools/rmbg/vendor/birefnet/NOTICE.md",
+)
+
+
+def unmanaged_rmbg_file(path: str) -> bool:
+    return path.casefold().startswith("tools/rmbg/") and path not in RMBG_MANAGED_FILES
+
+
+def restricted_optional_file(path: str) -> bool:
+    """Publication deny-list only; never removes locally installed components."""
+    parts = path.replace('\\', '/').casefold().split('/')
+    return any('selflift' in part for part in parts)
+
+
 INTEGRITY_FILES = (
+    "backend/app/illustrated_transitions.py",
+    "backend/app/vibe_agent_diagnostics.py",
+    "backend/app/vibe_transition_source.py",
+    "backend/app/vibe_transitions.py",
+    "backend/app/video_bookends.py",
+    "frontend/src/components/VideoBookends.vue",
+    "frontend/src/narrationFollow.js",
     "OCV_Launcher.exe",
     "start_windows.bat",
     "frontend/src/App.vue",
@@ -48,6 +80,13 @@ INTEGRITY_FILES = (
     "frontend/src/videoPromptWarnings.js",
     "frontend/src/serialTaskQueue.js",
     "frontend/src/rhWorkflowResolution.js",
+    "frontend/src/components/ShotResultOverview.vue",
+    "frontend/src/components/TtsStructureControls.vue",
+    "backend/app/narration_structure.py",
+    "backend/app/tts_structure_edit.py",
+    "backend/app/final_narration.py",
+    "backend/app/video_audio_sync.py",
+    "tools/launcher_service_probe.py",
     "backend/app/comfyui_bridge.py",
     "backend/app/h3_prompt_agent.py",
     "backend/app/presenter_mode.py",
@@ -56,6 +95,7 @@ INTEGRITY_FILES = (
     "backend/vendor/pypinyin/pinyin_dict.json",
     "backend/vendor/pypinyin/phrases_dict.json",
     "backend/app/main.py",
+    "backend/app/release_version.py",
     "backend/app/language_presets.py",
     "backend/app/gemini_client.py",
     "backend/app/image_profiles.py",
@@ -100,6 +140,7 @@ INTEGRITY_FILES = (
     "module6_dynamic_video.py",
     "launcher/safe_update_helper.ps1",
     "launcher/update-sources.json",
+    "launcher/optional-components.json",
     "tools/deploy_indextts25.ps1",
     "tools/portable_preflight.py",
     "backend/app/codex_bridge.py",
@@ -118,15 +159,31 @@ INTEGRITY_FILES = (
     "plugins/codex_bridge/plugin.json",
     "plugins/codex_bridge/ocv_bridge.py",
     "plugins/codex_bridge/README.md",
+    "plugins/codex_bridge/README_MCP.md",
+    "plugins/codex_bridge/AI_GUIDE.md",
+    "plugins/codex_bridge/mcp_server.py",
+    "plugins/codex_bridge/mcp-requirements.txt",
+    "plugins/codex_bridge/ocv_mcp/__init__.py",
+    "plugins/codex_bridge/ocv_mcp/adapter.py",
+    "plugins/codex_bridge/ocv_mcp/catalog.py",
+    "plugins/codex_bridge/ocv_mcp/contracts.py",
+    "plugins/codex_bridge/ocv_mcp/guidance.py",
+    "plugins/codex_bridge/ocv_mcp/server.py",
+    "plugins/codex_bridge/ocv_mcp/state.py",
+    "tools/setup_ocv_mcp.ps1",
     "plugins/codex_bridge/skills/ocv-production-bridge/SKILL.md",
     "plugins/codex_bridge/skills/ocv-production-bridge/agents/openai.yaml",
     "comfyui_plugins/README.md",
     "comfyui/README.md",
     "tts/README.md",
     "tools/migrate_optional_components.ps1",
+    "backend/app/vibe_rmbg.py",
+    "backend/app/vibe_rmbg_runtime.py",
+    "backend/app/vibe_rmbg_model.py",
+    *RMBG_MANAGED_FILES,
 )
 
-TEXT_EXTENSIONS = {".bat", ".cjs", ".css", ".js", ".json", ".ps1", ".py", ".vue", ".md", ".yaml"}
+TEXT_EXTENSIONS = {".bat", ".cjs", ".css", ".js", ".json", ".ps1", ".py", ".vue", ".md", ".yaml", ".txt"}
 
 
 def validate_launcher_integrity_files(root: Path) -> None:
